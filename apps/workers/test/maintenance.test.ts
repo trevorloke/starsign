@@ -7,6 +7,7 @@ function fakeStarsign() {
     metrics: { captureAccountMetrics: vi.fn(async () => ({ accounts: 0, metrics: 0 })) },
     links: { rollup: vi.fn(async () => 0) },
     entities: { scanPublic: vi.fn(async () => ({ entities: 0, found: 0, stored: 0, errors: [] })) },
+    reports: { sendDue: vi.fn(async () => ({ due: 0, sent: 0, failed: 0, skipped: 0 })) },
     ctx: { now: () => new Date() },
   };
 }
@@ -14,7 +15,7 @@ function fakeStarsign() {
 describe("background jobs without Redis", () => {
   it("lists every job once with its cadence", () => {
     const jobs = maintenanceJobs({ ingestEveryMs: 1000 });
-    expect(jobs.map((j) => j.name)).toEqual(["ingest", "outcomes", "account-metrics", "links", "tracker-scan", "sources", "forecasts"]);
+    expect(jobs.map((j) => j.name)).toEqual(["ingest", "outcomes", "account-metrics", "links", "tracker-scan", "sources", "forecasts", "reports", "ai-visibility"]);
     expect(jobs[0]!.everyMs).toBe(1000);
   });
 
@@ -23,7 +24,7 @@ describe("background jobs without Redis", () => {
     const m = fakeStarsign();
     const log: string[] = [];
     const jobs = startInProcessJobs(m as unknown as Starsign, { firstRunAfterMs: 1000, log: (l) => log.push(l) });
-    expect(log[0]).toMatch(/running 7 background jobs/);
+    expect(log[0]).toMatch(/running 9 background jobs/);
     await vi.advanceTimersByTimeAsync(500);
     expect(m.metrics.captureAccountMetrics).not.toHaveBeenCalled(); // nothing before the server is up
     await vi.advanceTimersByTimeAsync(40_000);

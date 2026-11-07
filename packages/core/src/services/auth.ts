@@ -99,6 +99,8 @@ export interface MailMessage {
   to: string;
   subject: string;
   text: string;
+  /** Optional HTML body (client reports); `text` stays the plain-text alternative. */
+  html?: string;
 }
 export interface Mailer {
   send(msg: MailMessage): Promise<void>;
@@ -114,7 +116,7 @@ export function resendMailerFromEnv(env: NodeJS.ProcessEnv = process.env): Maile
       const res = await fetch("https://api.resend.com/emails", {
         method: "POST",
         headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
-        body: JSON.stringify({ from, to: [msg.to], subject: msg.subject, text: msg.text }),
+        body: JSON.stringify({ from, to: [msg.to], subject: msg.subject, text: msg.text, ...(msg.html ? { html: msg.html } : {}) }),
       });
       if (!res.ok) throw new Error(`resend answered ${res.status}: ${(await res.text()).slice(0, 200)}`);
     },

@@ -136,6 +136,9 @@ describe("schemas", () => {
       translateMessages: { to: "en", items: [{ id: "a1", text: "新商品はいつ？", lang: "ja" }, { id: "a2", text: "hello", lang: "en" }] },
       translateKeywords: { keywords: ["rain jacket"], languages: ["ja", "es"], keepAsIs: ["Acme"] },
       suggestAliases: { name: "Maria Lopez", kind: "person", role: "candidate", parent: "Green Party", languages: ["en", "es"], existing: [] },
+      // ---- AI answer visibility
+      judgeAnswer: { workspace: "Acme", question: "Best scheduling app?", lang: "en", engine: "Claude", answer: "Acme Scheduling is the best pick.", entities: [{ id: "e1", name: "Acme Scheduling", kind: "organization", relation: "own", matched: "Acme Scheduling" }] },
+      suggestQuestions: { workspace: { name: "Acme", profile: { topics: ["async work"] } }, entities: [{ name: "Acme Scheduling", kind: "organization", relation: "own" }], languages: ["en", "ja"], existing: [], count: 4 },
     };
     for (const p of ALL_PROMPTS) {
       const format = betaZodOutputFormat(p.schema);

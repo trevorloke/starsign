@@ -1,7 +1,8 @@
 import type { ActivityInput, ActivityKind, Media, MetricInput, MetricName, Network } from "@starsign/schema";
 import { z } from "zod";
-import { asNetworkError, classifyHttpStatus, downloadMedia, isAfter, readJson, resolveFetch, type FetchLike } from "./http.ts";
+import { asNetworkError, classifyHttpStatus, isAfter, readJson, resolveFetch, type FetchLike } from "./http.ts";
 import { IdempotencyCache } from "./idempotency.ts";
+import { StreamingForm, mediaSource, sendBody, setMediaFile, uploadForm, withUpload } from "./media-io.ts";
 import type { AccountIdentity, AccountRef, ConnectedAccount, Connector, ConnectorCapabilities, MediaFetcher, ModerationInput, PublishInput, PublishResult, ValidationIssue } from "./types.ts";
 import { ConnectorError } from "./types.ts";
 
@@ -264,14 +265,17 @@ export class MisskeyConnector implements Connector {
     if (done) return done;
     const ids: string[] = [];
     for (const m of media) {
-      const { bytes, mime } = this.media ? await this.media.fetch(m) : await downloadMedia(resolveFetch(this.fetchImpl), m);
-      const form = new FormData();
-      form.set("i", auth.token);
-      form.set("file", new Blob([bytes], { type: mime }), `upload.${mime.split("/")[1]?.split("+")[0] ?? "bin"}`);
-      if (m.alt) form.set("comment", m.alt.slice(0, 512));
-      if (sensitive) form.set("isSensitive", "true");
-      // Without force, Misskey returns an existing drive file with the same hash instead of a new one: what we want.
-      const file = (await this.raw(auth.host, null, "/api/drive/files/create", form)) as MisskeyDriveFile | undefined;
+      // Videos go up as a streamed multipart body (exact Content-Length); images are read whole as before.
+      const file = await withUpload(mediaSource(this.media, this.fetchImpl), m, async (r) => {
+        const mime = r.mime;
+        const form = uploadForm([r]);
+        form.set("i", auth.token);
+        setMediaFile(form, "file", r, `upload.${mime.split("/")[1]?.split("+")[0] ?? "bin"}`);
+        if (m.alt) form.set("comment", m.alt.slice(0, 512));
+        if (sensitive) form.set("isSensitive", "true");
+        // Without force, Misskey returns an existing drive file with the same hash instead of a new one: what we want.
+        return (await this.raw(auth.host, null, "/api/drive/files/create", form)) as MisskeyDriveFile | undefined;
+      });
       if (!file?.id) throw new ConnectorError("misskey media: upload returned no file id", "unknown", false, file);
       ids.push(file.id);
     }
@@ -375,16 +379,19 @@ export class MisskeyConnector implements Connector {
     return this.raw(auth.host, auth.token, path, body);
   }
 
-  private async raw(host: string, token: string | null, path: string, body: Record<string, unknown> | FormData): Promise<unknown> {
+  private async raw(host: string, token: string | null, path: string, body: Record<string, unknown> | FormData | StreamingForm): Promise<unknown> {
     const init: RequestInit = { method: "POST", headers: { accept: "application/json" } };
     if (body instanceof FormData) init.body = body;
-    else {
+    else if (!(body instanceof StreamingForm)) {
       init.headers = { accept: "application/json", "content-type": "application/json" };
       init.body = JSON.stringify(token ? { ...body, i: token } : body);
     }
     let res: Response;
     try {
-      res = await resolveFetch(this.fetchImpl)(`https://${host}${path}`, init);
+      res =
+        body instanceof StreamingForm
+          ? await sendBody(resolveFetch(this.fetchImpl), `https://${host}${path}`, { method: "POST", headers: { accept: "application/json" } }, body)
+          : await resolveFetch(this.fetchImpl)(`https://${host}${path}`, init);
     } catch (err) {
       throw asNetworkError(err, `misskey ${path} (${host})`);
     }

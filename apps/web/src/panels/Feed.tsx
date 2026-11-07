@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import type { Account, Activity, ActivityKind, FeedQuery, LanguagesInfo, LiveStatus, ModerateAction, Network, PostDetail, Violation } from "../types";
+import type { Account, Activity, ActivityKind, FeedEvent, FeedQuery, LanguagesInfo, LiveStatus, ModerateAction, Network, PostDetail, Violation } from "../types";
+import { Inbox } from "./Inbox"; // ---- inbox workflow
 import { api, errorText, isApiError, USE_FIXTURES } from "../api";
 import { Menu } from "../components/Menu";
 import { NetworkBadge } from "../components/NetworkBadge";
@@ -31,7 +32,53 @@ export interface FeedEntityFilter {
   withPeople: boolean;
 }
 
-export function Feed({
+// ---- inbox workflow: the panel is the plain feed or the team inbox, the person's pick (remembered on this device).
+const FEED_MODE_STORAGE = "starsign.feedMode";
+type FeedMode = "feed" | "inbox";
+function readFeedMode(): FeedMode {
+  try {
+    return localStorage.getItem(FEED_MODE_STORAGE) === "inbox" ? "inbox" : "feed";
+  } catch {
+    return "feed";
+  }
+}
+
+export function Feed(
+  props: FeedProps & {
+    /** SSE "inbox" events counter and the last event (for mentions and assignments). */
+    inboxTick?: number;
+    inboxEvent?: FeedEvent | null;
+  },
+) {
+  const [mode, setMode] = useState<FeedMode>(readFeedMode);
+  const change = (m: FeedMode) => {
+    setMode(m);
+    try {
+      localStorage.setItem(FEED_MODE_STORAGE, m);
+    } catch {
+      // fine: the pick lasts for this page load
+    }
+  };
+  const modeSwitch = (
+    <div className="seg seg-small feed-mode" role="radiogroup" aria-label="Show the feed or the team inbox">
+      {(["feed", "inbox"] as FeedMode[]).map((m) => (
+        <button key={m} type="button" role="radio" aria-checked={mode === m} className="seg-btn" onClick={() => change(m)}>
+          {m === "feed" ? "Feed" : "Inbox"}
+        </button>
+      ))}
+    </div>
+  );
+  // An entity filter from the tracker ("Show in feed") is a feed view.
+  if (mode === "inbox" && !props.entity) {
+    return <Inbox accounts={props.accounts} liveTick={props.liveTick} liveStatus={props.liveStatus} inboxTick={props.inboxTick ?? 0} inboxEvent={props.inboxEvent ?? null} languages={props.languages} modeSwitch={modeSwitch} />;
+  }
+  return <PlainFeed {...props} modeSwitch={modeSwitch} />;
+}
+
+type FeedProps = Parameters<typeof PlainFeed>[0];
+// ---- end inbox workflow
+
+function PlainFeed({
   accounts,
   liveTick,
   liveStatus,
@@ -39,6 +86,7 @@ export function Feed({
   languages,
   entity = null,
   onClearEntity,
+  modeSwitch,
 }: {
   accounts: Account[];
   liveTick: number;
@@ -49,6 +97,8 @@ export function Feed({
   /** Set from the tracker's "Show in feed". */
   entity?: FeedEntityFilter | null;
   onClearEntity?: () => void;
+  /** inbox workflow: the Feed / Inbox switch. */
+  modeSwitch?: ReactNode;
 }) {
   const [kind, setKind] = useState<KindFilter>("all");
   const [network, setNetwork] = useState<Network | null>(null);
@@ -166,6 +216,7 @@ export function Feed({
     <section className="panel panel-feed" aria-labelledby="feed-title">
       <header className="panel-head">
         <h2 id="feed-title">Feed</h2>
+        {modeSwitch}
         <span className={`live live-${liveStatus}`}>
           <span className="live-dot" aria-hidden="true" />
           {LIVE_LABEL[liveStatus]}

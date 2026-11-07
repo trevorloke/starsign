@@ -3257,3 +3257,39 @@ export function openFixtureStream(h: StreamHandlers): () => void {
     h.onStatus("off");
   };
 }
+
+// ---- inbox workflow: the shared inbox's fixture "server" lives in ./inboxFixtures.ts, over this feed and this team.
+import { createInboxFixtures } from "./inboxFixtures";
+export const inboxFixtureApi = createInboxFixtures({
+  feed: () => state.feed,
+  members: () => store.members,
+  me: () => ({ userId: store.user.id, role: currentWs().role }),
+  workspaceName: () => currentWs().name,
+  accounts: () => currentAccounts(),
+});
+// ---- end inbox workflow
+
+// ---- analytics & client reports: six months of history and two sample reports (./fixtures-analytics.ts).
+import { createAnalyticsFixtures, sampleLogoDataUrl } from "./fixtures-analytics";
+mediaLibrary.push(asset("med_logo", "image", "image/svg+xml", sampleLogoDataUrl(), "northwind-wordmark.svg", { width: 480, height: 120, bytes: 1_400, alt: "Northwind wordmark" }, 24 * 30));
+export const analyticsFixtureApi = createAnalyticsFixtures({
+  accounts: () => currentAccounts(),
+  posts: () => allPosts(),
+  media: () => mediaLibrary,
+  role: () => currentWs().role,
+  workspaceId: () => currentWs().id,
+  workspaceName: () => currentWs().name,
+  timezone: () => policy.timezone,
+  linkReport: (from, to) => fixtureApi.linkReport(from, to),
+  entityReport: (from, to) => fixtureApi.entityReport(from, to),
+  calendar: (from, to) => fixtureApi.calendar(from, to),
+});
+// ---- end analytics & client reports
+
+// ---- AI answer visibility: the fixture "server" lives in ./visibility-fixtures.ts, over this workspace's tracked names.
+import { createVisibilityFixtures } from "./visibility-fixtures";
+export const visibilityFixtureApi = createVisibilityFixtures({
+  role: () => currentWs().role,
+  entities: () => wsEntities(),
+});
+// ---- end AI answer visibility

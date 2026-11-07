@@ -38,6 +38,7 @@ export function EntityDrawer({
   onOpen,
   onChanged,
   onShowInFeed,
+  onAiVisibility,
 }: {
   /** null: track a new name. */
   id: string | null;
@@ -55,6 +56,8 @@ export function EntityDrawer({
   /** Something was added, changed or archived: the tracker reloads. */
   onChanged: () => void;
   onShowInFeed: (filter: FeedEntityFilter) => void;
+  /** AI answer visibility: open the AI visibility drawer on this name. */
+  onAiVisibility?: (entityId: string) => void;
 }) {
   const toast = useToast();
   const { openTopic } = useRoom();
@@ -203,6 +206,11 @@ export function EntityDrawer({
               {entity.trendTopicId ? (
                 <button type="button" className="btn" onClick={() => openTopic(entity.trendTopicId!)}>
                   Momentum on the radar
+                </button>
+              ) : null}
+              {onAiVisibility ? (
+                <button type="button" className="btn" onClick={() => onAiVisibility(entity.id)}>
+                  How AI answers talk about {entity.name}
                 </button>
               ) : null}
               {canEdit ? (

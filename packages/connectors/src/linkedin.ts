@@ -3,6 +3,7 @@ import type { ActivityInput, ActivityKind, Media, MetricInput, MetricName, Netwo
 import { z } from "zod";
 import { asNetworkError, classifyHttpStatus, downloadMedia, isAfter, readJson, resolveFetch, type FetchLike } from "./http.ts";
 import { IdempotencyCache } from "./idempotency.ts";
+import { mediaSource, openMedia, rawBody, sendStream, withMedia, type StreamBody } from "./media-io.ts";
 import { OAuth2Client, clientFromEnv, type OAuth2Token } from "./oauth.ts";
 import type {
   AccountIdentity,
@@ -496,48 +497,55 @@ export class LinkedInConnector implements Connector {
 
   /** Images API / Documents API: initializeUpload, then one PUT of the bytes to the returned uploadUrl. */
   private async uploadSimple(auth: LinkedInAuth, owner: string, m: Media, resource: "images" | "documents"): Promise<string> {
-    const { bytes, mime } = await this.bytesOf(m);
-    const init = await this.call<{ value?: { uploadUrl?: string; image?: string; document?: string } }>(auth, "POST", `/rest/${resource}?action=initializeUpload`, {
-      json: { initializeUploadRequest: { owner } },
-      what: `${resource} initializeUpload`,
-    });
-    const v = init.body?.value;
-    const urn = resource === "images" ? v?.image : v?.document;
-    if (!v?.uploadUrl || !urn) throw new ConnectorError(`linkedin ${resource} initializeUpload: no uploadUrl/URN in response`, "unknown", false, init.body);
-    await this.put(auth, v.uploadUrl, bytes, mime, `${resource} upload`);
-    return urn;
+    // Documents (up to 100 MB) are sent as a streamed body; images are read whole as before.
+    const file = resource === "documents" ? await openMedia(mediaSource(this.media, this.fetchImpl), m) : null;
+    try {
+      const { bytes, mime } = file ? { bytes: null, mime: file.mime } : await this.bytesOf(m);
+      const init = await this.call<{ value?: { uploadUrl?: string; image?: string; document?: string } }>(auth, "POST", `/rest/${resource}?action=initializeUpload`, {
+        json: { initializeUploadRequest: { owner } },
+        what: `${resource} initializeUpload`,
+      });
+      const v = init.body?.value;
+      const urn = resource === "images" ? v?.image : v?.document;
+      if (!v?.uploadUrl || !urn) throw new ConnectorError(`linkedin ${resource} initializeUpload: no uploadUrl/URN in response`, "unknown", false, init.body);
+      await this.put(auth, v.uploadUrl, file ? rawBody(file) : bytes!, mime, `${resource} upload`);
+      return urn;
+    } finally {
+      await file?.close();
+    }
   }
 
-  /** Videos API: initializeUpload → PUT each part (collect ETags) → finalizeUpload. */
+  /** Videos API: initializeUpload → PUT each part (collect ETags) → finalizeUpload. Each part is read only for its own PUT. */
   private async uploadVideo(auth: LinkedInAuth, owner: string, m: Media, thumbnailUrl: string | undefined): Promise<string> {
-    const { bytes } = await this.bytesOf(m);
-    const init = await this.call<{
-      value?: { video?: string; uploadToken?: string; uploadInstructions?: { uploadUrl?: string; firstByte?: number; lastByte?: number }[]; thumbnailUploadUrl?: string };
-    }>(auth, "POST", "/rest/videos?action=initializeUpload", {
-      json: { initializeUploadRequest: { owner, fileSizeBytes: bytes.length, uploadCaptions: false, uploadThumbnail: !!thumbnailUrl } },
-      what: "videos initializeUpload",
+    return withMedia(mediaSource(this.media, this.fetchImpl), m, async (file) => {
+      const init = await this.call<{
+        value?: { video?: string; uploadToken?: string; uploadInstructions?: { uploadUrl?: string; firstByte?: number; lastByte?: number }[]; thumbnailUploadUrl?: string };
+      }>(auth, "POST", "/rest/videos?action=initializeUpload", {
+        json: { initializeUploadRequest: { owner, fileSizeBytes: file.size, uploadCaptions: false, uploadThumbnail: !!thumbnailUrl } },
+        what: "videos initializeUpload",
+      });
+      const v = init.body?.value;
+      if (!v?.video || !v.uploadInstructions?.length) throw new ConnectorError("linkedin videos initializeUpload: no video URN or upload instructions", "unknown", false, init.body);
+      const etags: string[] = [];
+      for (const part of v.uploadInstructions) {
+        if (!part.uploadUrl) throw new ConnectorError("linkedin videos: upload instruction without uploadUrl", "unknown", false, part);
+        const from = part.firstByte ?? 0;
+        const to = Math.min(file.size, (part.lastByte ?? file.size - 1) + 1);
+        const res = await this.put(auth, part.uploadUrl, await file.read(from, to - from), "application/octet-stream", "video part upload");
+        const etag = res.headers.get("etag");
+        if (!etag) throw new ConnectorError("linkedin video part upload: response had no ETag", "unknown", true);
+        etags.push(etag);
+      }
+      if (thumbnailUrl && v.thumbnailUploadUrl) {
+        const thumb = await downloadMedia(resolveFetch(this.fetchImpl), { kind: "image", url: thumbnailUrl });
+        await this.put(auth, v.thumbnailUploadUrl, thumb.bytes, thumb.mime, "video thumbnail upload");
+      }
+      await this.call(auth, "POST", "/rest/videos?action=finalizeUpload", {
+        json: { finalizeUploadRequest: { video: v.video, uploadToken: v.uploadToken ?? "", uploadedPartIds: etags } },
+        what: "videos finalizeUpload",
+      });
+      return v.video;
     });
-    const v = init.body?.value;
-    if (!v?.video || !v.uploadInstructions?.length) throw new ConnectorError("linkedin videos initializeUpload: no video URN or upload instructions", "unknown", false, init.body);
-    const etags: string[] = [];
-    for (const part of v.uploadInstructions) {
-      if (!part.uploadUrl) throw new ConnectorError("linkedin videos: upload instruction without uploadUrl", "unknown", false, part);
-      const from = part.firstByte ?? 0;
-      const to = (part.lastByte ?? bytes.length - 1) + 1;
-      const res = await this.put(auth, part.uploadUrl, bytes.subarray(from, to), "application/octet-stream", "video part upload");
-      const etag = res.headers.get("etag");
-      if (!etag) throw new ConnectorError("linkedin video part upload: response had no ETag", "unknown", true);
-      etags.push(etag);
-    }
-    if (thumbnailUrl && v.thumbnailUploadUrl) {
-      const thumb = await downloadMedia(resolveFetch(this.fetchImpl), { kind: "image", url: thumbnailUrl });
-      await this.put(auth, v.thumbnailUploadUrl, thumb.bytes, thumb.mime, "video thumbnail upload");
-    }
-    await this.call(auth, "POST", "/rest/videos?action=finalizeUpload", {
-      json: { finalizeUploadRequest: { video: v.video, uploadToken: v.uploadToken ?? "", uploadedPartIds: etags } },
-      what: "videos finalizeUpload",
-    });
-    return v.video;
   }
 
   /** Poll an uploaded asset until AVAILABLE; failure is final, a timeout is retryable (the upload is remembered). */
@@ -777,10 +785,14 @@ export class LinkedInConnector implements Connector {
   }
 
   /** Upload URLs are LinkedIn-hosted and take the same bearer token. */
-  private async put(auth: LinkedInAuth, url: string, bytes: Uint8Array, mime: string, what: string): Promise<Response> {
+  private async put(auth: LinkedInAuth, url: string, bytes: Uint8Array | StreamBody, mime: string, what: string): Promise<Response> {
     let res: Response;
     try {
-      res = await resolveFetch(this.fetchImpl)(url, { method: "PUT", headers: { authorization: `Bearer ${auth.accessToken}`, "content-type": mime }, body: new Blob([bytes], { type: mime }) });
+      const headers = { authorization: `Bearer ${auth.accessToken}`, "content-type": mime };
+      res =
+        bytes instanceof Uint8Array
+          ? await resolveFetch(this.fetchImpl)(url, { method: "PUT", headers, body: new Blob([bytes], { type: mime }) })
+          : await sendStream(resolveFetch(this.fetchImpl), url, { method: "PUT", headers }, bytes);
     } catch (err) {
       throw asNetworkError(err, `linkedin ${what}`);
     }

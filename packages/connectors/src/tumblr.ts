@@ -1,7 +1,8 @@
-import type { ActivityInput, ActivityKind, Media, MetricInput, MetricName, Network } from "@starsign/schema";
+import type { ActivityInput, ActivityKind, MetricInput, MetricName, Network } from "@starsign/schema";
 import { z } from "zod";
-import { asNetworkError, classifyHttpStatus, downloadMedia, isAfter, readJson, resolveFetch, type FetchLike } from "./http.ts";
+import { asNetworkError, classifyHttpStatus, isAfter, readJson, resolveFetch, type FetchLike } from "./http.ts";
 import { IdempotencyCache } from "./idempotency.ts";
+import { mediaSource, openForUpload, sendBody, setMediaFile, uploadForm, type MediaReader, type StreamingForm } from "./media-io.ts";
 import { OAuth2Client, clientFromEnv, type OAuth2Token } from "./oauth.ts";
 import type { AccountIdentity, AccountRef, AuthRefresh, ConnectedAccount, Connector, ConnectorCapabilities, ModerationInput, PublishInput, PublishResult, ValidationIssue } from "./types.ts";
 import { ConnectorError } from "./types.ts";
@@ -284,40 +285,42 @@ export class TumblrConnector implements Connector {
     const content: Record<string, unknown>[] = [];
     if (o.title) content.push({ type: "text", subtype: "heading1", text: o.title });
     content.push(...textToBlocks(input.text));
-    const files: { identifier: string; bytes: Uint8Array; mime: string }[] = [];
-    for (const [i, m] of input.media.entries()) {
-      const { bytes, mime } = await this.read(m);
-      const identifier = `${m.kind === "video" ? "video" : "image"}${i}`;
-      files.push({ identifier, bytes, mime });
-      const media = { type: mime, identifier, ...(m.width ? { width: m.width } : {}), ...(m.height ? { height: m.height } : {}) };
-      // Image blocks take an array of sizes; video blocks a single media object.
-      content.push(m.kind === "video" ? { type: "video", media } : { type: "image", media: [media], ...(m.alt ? { alt_text: m.alt } : {}) });
-    }
-    if (o.link) content.push({ type: "link", url: o.link, ...(o.title ? { title: o.title } : {}) });
-    const post: Record<string, unknown> = {
-      content,
-      state: "published",
-      ...(o.tags?.length ? { tags: o.tags.map((t) => t.replace(/,/g, " ").replace(/^#/, "")).join(",") } : {}),
-    };
+    // Videos are opened for streaming: the multipart body is then streamed with an exact Content-Length.
+    const files: { identifier: string; file: MediaReader; mime: string }[] = [];
     let r: { id?: string | number; id_string?: string };
-    const path = `/blog/${encodeURIComponent(auth.blogName)}/posts`;
-    if (files.length === 0) {
-      r = await this.request(auth.accessToken, "POST", path, { json: post, what: "create post" });
-    } else {
-      // Multipart: the post JSON in a "json" part, each file in a part named by its identifier.
-      const form = new FormData();
-      form.set("json", new Blob([JSON.stringify(post)], { type: "application/json" }));
-      for (const f of files) form.set(f.identifier, new Blob([f.bytes], { type: f.mime }), `${f.identifier}.${extOf(f.mime)}`);
-      r = await this.request(auth.accessToken, "POST", path, { form, what: "create post" });
+    try {
+      for (const [i, m] of input.media.entries()) {
+        const file = await openForUpload(mediaSource(this.media, this.fetchImpl), m);
+        const mime = file.mime;
+        const identifier = `${m.kind === "video" ? "video" : "image"}${i}`;
+        files.push({ identifier, file, mime });
+        const media = { type: mime, identifier, ...(m.width ? { width: m.width } : {}), ...(m.height ? { height: m.height } : {}) };
+        // Image blocks take an array of sizes; video blocks a single media object.
+        content.push(m.kind === "video" ? { type: "video", media } : { type: "image", media: [media], ...(m.alt ? { alt_text: m.alt } : {}) });
+      }
+      if (o.link) content.push({ type: "link", url: o.link, ...(o.title ? { title: o.title } : {}) });
+      const post: Record<string, unknown> = {
+        content,
+        state: "published",
+        ...(o.tags?.length ? { tags: o.tags.map((t) => t.replace(/,/g, " ").replace(/^#/, "")).join(",") } : {}),
+      };
+      const path = `/blog/${encodeURIComponent(auth.blogName)}/posts`;
+      if (files.length === 0) {
+        r = await this.request(auth.accessToken, "POST", path, { json: post, what: "create post" });
+      } else {
+        // Multipart: the post JSON in a "json" part, each file in a part named by its identifier.
+        // TODO(verify): NPF also accepts `media: [{ url }]` for public URLs; uploading bytes is the documented path.
+        const form = uploadForm(files.map((f) => f.file));
+        form.set("json", new Blob([JSON.stringify(post)], { type: "application/json" }));
+        for (const f of files) setMediaFile(form, f.identifier, f.file, `${f.identifier}.${extOf(f.mime)}`);
+        r = await this.request(auth.accessToken, "POST", path, { form, what: "create post" });
+      }
+    } finally {
+      for (const f of files) await f.file.close();
     }
     const id = r.id_string ?? (r.id !== undefined ? String(r.id) : undefined);
     if (!id) throw new ConnectorError("tumblr create post: response had no id", "unknown", false, r);
     return { externalId: id, url: tumblrPostUrl(auth.blogName, id), raw: r };
-  }
-
-  private async read(m: Media): Promise<{ bytes: Uint8Array; mime: string }> {
-    // TODO(verify): NPF also accepts `media: [{ url }]` for public URLs; uploading bytes is the documented path.
-    return this.media ? this.media.fetch(m) : downloadMedia(resolveFetch(this.fetchImpl), m);
   }
 
   // ---- inbox ----------------------------------------------------------------------------
@@ -397,9 +400,9 @@ export class TumblrConnector implements Connector {
 
   // ---- transport ------------------------------------------------------------------------
 
-  private async request<T>(token: string, method: string, path: string, opts: { json?: unknown; form?: FormData; what: string }): Promise<T> {
+  private async request<T>(token: string, method: string, path: string, opts: { json?: unknown; form?: FormData | StreamingForm; what: string }): Promise<T> {
     const headers: Record<string, string> = { authorization: `Bearer ${token}`, accept: "application/json" };
-    let body: string | FormData | undefined;
+    let body: string | FormData | StreamingForm | undefined;
     if (opts.form) body = opts.form;
     else if (opts.json !== undefined) {
       headers["content-type"] = "application/json";
@@ -407,7 +410,7 @@ export class TumblrConnector implements Connector {
     }
     let res: Response;
     try {
-      res = await resolveFetch(this.fetchImpl)(`${this.baseUrl}${path}`, { method, headers, ...(body !== undefined ? { body } : {}) });
+      res = await sendBody(resolveFetch(this.fetchImpl), `${this.baseUrl}${path}`, { method, headers }, body);
     } catch (err) {
       throw asNetworkError(err, `tumblr ${opts.what}`);
     }

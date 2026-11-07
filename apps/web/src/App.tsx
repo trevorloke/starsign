@@ -14,6 +14,7 @@ import { LinksDrawer } from "./drawers/LinksDrawer";
 import { LanguagesDrawer } from "./drawers/LanguagesDrawer";
 import { TopicDrawer } from "./drawers/TopicDrawer";
 import { EntityDrawer } from "./drawers/EntityDrawer";
+import { VisibilityDrawer } from "./drawers/VisibilityDrawer"; // ---- AI answer visibility
 import { SettingsDrawer } from "./drawers/SettingsDrawer";
 import { AUTONOMY_LABEL, lift as formatLift, listOf, networkLabel, plural, roleLabel } from "./lib/format";
 import type { SettingsSectionId } from "./lib/policy";
@@ -28,14 +29,17 @@ import { Feed, type FeedEntityFilter } from "./panels/Feed";
 import { Queue } from "./panels/Queue";
 import { Radar } from "./panels/Radar";
 import { Tracker } from "./panels/Tracker";
+// ---- analytics & client reports
+import { Analytics } from "./panels/Analytics";
+import { ReportsDrawer } from "./drawers/ReportsDrawer";
 
 type Theme = "light" | "dark";
 const THEME_STORAGE = "starsign.theme";
 const TAB_STORAGE = "starsign.tab";
 const CENTER_STORAGE = "starsign.center";
 
-type CenterView = "queue" | "calendar" | "tracker";
-const CENTER_VIEWS: CenterView[] = ["queue", "calendar", "tracker"];
+type CenterView = "queue" | "calendar" | "tracker" | "analytics";
+const CENTER_VIEWS: CenterView[] = ["queue", "calendar", "tracker", "analytics"];
 const isCenterView = (v: string | null): v is CenterView => !!v && (CENTER_VIEWS as string[]).includes(v);
 
 // --- Theme ---------------------------------------------------------------
@@ -292,6 +296,10 @@ type DrawerState =
   | { kind: "settings"; section?: SettingsSectionId }
   /** id null: track a new name. */
   | { kind: "entity"; id: string | null; edit?: boolean; preset?: { parentId?: string; kind?: EntityKind } }
+  // ---- AI answer visibility: entityId opens it on that name
+  | { kind: "visibility"; entityId?: string | null }
+  // ---- analytics & client reports
+  | { kind: "reports" }
   | null;
 
 function readCenter(): CenterView {
@@ -318,6 +326,9 @@ function CenterSwitch({ view, onChange, waiting, title }: { view: CenterView; on
         </button>
         <button type="button" role="tab" aria-selected={view === "tracker"} className="seg-btn" onClick={() => onChange("tracker")}>
           Tracker
+        </button>
+        <button type="button" role="tab" aria-selected={view === "analytics"} className="seg-btn" onClick={() => onChange("analytics")}>
+          Analytics
         </button>
       </div>
     </>
@@ -577,6 +588,7 @@ function Room({
     { id: "queue", label: "Queue", badge: waiting ?? undefined },
     { id: "calendar", label: "Calendar" },
     { id: "tracker", label: "Tracker" },
+    { id: "analytics", label: "Analytics" },
     { id: "feed", label: "Feed" },
     { id: "brief", label: "Brief" },
   ];
@@ -707,10 +719,33 @@ function Room({
                       className="menu-item"
                       onClick={() => {
                         close();
+                        setDrawer({ kind: "reports" });
+                      }}
+                    >
+                      Reports
+                    </button>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className="menu-item"
+                      onClick={() => {
+                        close();
                         setDrawer({ kind: "languages" });
                       }}
                     >
                       Languages
+                    </button>
+                    {/* ---- AI answer visibility */}
+                    <button
+                      type="button"
+                      role="menuitem"
+                      className="menu-item"
+                      onClick={() => {
+                        close();
+                        setDrawer({ kind: "visibility" });
+                      }}
+                    >
+                      AI visibility
                     </button>
                     <button
                       type="button"
@@ -791,10 +826,21 @@ function Room({
                 />
               </div>
             ) : null}
+            {center === "analytics" || tab === "analytics" ? (
+              <div className="col-queue col-analytics" data-panel="analytics">
+                <Analytics
+                  head={<CenterSwitch view="analytics" onChange={changeCenter} waiting={waiting} title="Analytics" />}
+                  refreshTick={postTick}
+                  onOpenReports={() => setDrawer({ kind: "reports" })}
+                />
+              </div>
+            ) : null}
             <div className="col-feed" data-panel="feed">
               <Feed
                 accounts={accounts}
                 liveTick={live.counters.activity}
+                inboxTick={live.counters.inbox /* inbox workflow */}
+                inboxEvent={live.last?.type === "inbox" ? live.last : null}
                 liveStatus={live.status}
                 canDelete={canDelete}
                 languages={languages}
@@ -831,6 +877,7 @@ function Room({
             onClose={closeDrawer}
           />
         ) : null}
+        {drawer?.kind === "reports" ? <ReportsDrawer myRole={(currentWorkspace?.role ?? (me?.role as Role | null | undefined)) ?? null} onClose={closeDrawer} /> : null}
         {drawer?.kind === "links" ? <LinksDrawer myRole={(currentWorkspace?.role ?? (me?.role as Role | null | undefined)) ?? null} onClose={closeDrawer} /> : null}
         {drawer?.kind === "entity" ? (
           <EntityDrawer
@@ -850,7 +897,12 @@ function Room({
               void loadRadar();
             }}
             onShowInFeed={showInFeed}
+            onAiVisibility={(entityId) => setDrawer({ kind: "visibility", entityId })} // ---- AI answer visibility
           />
+        ) : null}
+        {/* ---- AI answer visibility */}
+        {drawer?.kind === "visibility" ? (
+          <VisibilityDrawer key={drawer.entityId ?? "all"} myRole={(currentWorkspace?.role ?? (me?.role as Role | null | undefined)) ?? null} focusEntityId={drawer.entityId ?? null} onClose={closeDrawer} />
         ) : null}
         {drawer?.kind === "settings" ? (
           <SettingsDrawer

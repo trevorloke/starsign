@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
 import type { ActivityInput, ActivityKind, Media, MetricInput, Network } from "@starsign/schema";
 import { z } from "zod";
-import { asNetworkError, downloadMedia, readJson, resolveFetch, type FetchLike } from "./http.ts";
+import { asNetworkError, readJson, resolveFetch, type FetchLike } from "./http.ts";
 import { IdempotencyCache } from "./idempotency.ts";
+import { isStreamBody, mediaSource, rawBody, sendBody, withUpload, type StreamBody } from "./media-io.ts";
 import type { AccountIdentity, AccountRef, ConnectedAccount, Connector, ConnectorCapabilities, MediaFetcher, ModerationInput, PublishInput, PublishResult, ValidationIssue } from "./types.ts";
 import { ConnectorError } from "./types.ts";
 
@@ -550,14 +551,17 @@ export class MatrixConnector implements Connector {
 
   /** POST /_matrix/media/v3/upload, then the m.image / m.video / m.audio / m.file content pointing at the mxc:// URI. */
   private async uploadContent(auth: MatrixAuth, m: Media, i: number): Promise<Record<string, unknown>> {
-    const { bytes, mime } = this.media ? await this.media.fetch(m) : await downloadMedia(resolveFetch(this.fetchImpl), m);
-    const filename = fileName(m, mime, i);
-    // TODO(verify): authenticated media (Matrix 1.11, MSC3916) moved download/thumbnail to /_matrix/client/v1/media/*;
-    // upload is still /_matrix/media/v3/upload on current homeservers.
-    const up = await this.call<{ content_uri: string }>(auth.homeserver, auth.accessToken, "POST", `/_matrix/media/v3/upload?filename=${encodeURIComponent(filename)}`, "upload media", bytes, mime);
+    // Videos and documents are sent as a streamed body with an exact Content-Length; images are read whole.
+    const { up, mime, size, filename } = await withUpload(mediaSource(this.media, this.fetchImpl), m, async (file) => {
+      const filename = fileName(m, file.mime, i);
+      // TODO(verify): authenticated media (Matrix 1.11, MSC3916) moved download/thumbnail to /_matrix/client/v1/media/*;
+      // upload is still /_matrix/media/v3/upload on current homeservers.
+      const up = await this.call<{ content_uri: string }>(auth.homeserver, auth.accessToken, "POST", `/_matrix/media/v3/upload?filename=${encodeURIComponent(filename)}`, "upload media", rawBody(file), file.mime);
+      return { up, mime: file.mime, size: file.size, filename };
+    });
     if (!up.content_uri?.startsWith("mxc://")) throw new ConnectorError("matrix upload media: no content_uri in the response", "unknown", false, up);
     const msgtype = m.kind === "video" ? "m.video" : mime.startsWith("image/") ? "m.image" : mime.startsWith("audio/") ? "m.audio" : "m.file";
-    const info: Record<string, unknown> = { mimetype: mime, size: bytes.byteLength };
+    const info: Record<string, unknown> = { mimetype: mime, size };
     if (m.width) info.w = m.width;
     if (m.height) info.h = m.height;
     if (m.durationSeconds) info.duration = Math.round(m.durationSeconds * 1000);
@@ -648,8 +652,8 @@ export class MatrixConnector implements Connector {
   private async call<T>(homeserver: string, token: string | null, method: string, path: string, what: string, body?: unknown, contentType?: string): Promise<T> {
     const headers: Record<string, string> = {};
     if (token) headers.authorization = `Bearer ${token}`;
-    let payload: string | Uint8Array | undefined;
-    if (body instanceof Uint8Array) {
+    let payload: string | Uint8Array | StreamBody | undefined;
+    if (body instanceof Uint8Array || isStreamBody(body)) {
       headers["content-type"] = contentType ?? "application/octet-stream";
       payload = body;
     } else if (body !== undefined) {
@@ -660,7 +664,8 @@ export class MatrixConnector implements Connector {
     for (let attempt = 0; ; attempt++) {
       let res: Response;
       try {
-        res = await resolveFetch(this.fetchImpl)(`${homeserver}${path}`, { method, headers, ...(payload !== undefined ? { body: payload } : {}) });
+        // A StreamBody opens a fresh stream for each attempt.
+        res = await sendBody(resolveFetch(this.fetchImpl), `${homeserver}${path}`, { method, headers }, payload);
       } catch (err) {
         throw asNetworkError(new Error(scrub(err instanceof Error ? err.message : String(err))), `matrix ${what}`);
       }

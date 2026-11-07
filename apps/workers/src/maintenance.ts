@@ -1,6 +1,8 @@
 import type { Starsign } from "@starsign/core";
 import { createMentionSearches } from "@starsign/sources";
 import { captureOutcomes, ingestAll, pullSources, refreshForecasts } from "./jobs.ts";
+// ---- AI answer visibility
+import { runVisibility } from "./visibility.ts";
 
 /** A background job: what it does and how often. One table for the Redis workers and the single-process runner. */
 export interface MaintenanceJob {
@@ -37,6 +39,10 @@ export function maintenanceJobs(opts: MaintenanceOptions = {}): MaintenanceJob[]
     },
     { name: "sources", everyMs: opts.sourcesEveryMs ?? 60 * MIN, run: (m) => pullSources(m) },
     { name: "forecasts", everyMs: opts.forecastEveryMs ?? 60 * MIN, run: async (m) => ({ topics: await refreshForecasts(m) }) },
+    // Scheduled client reports; each period is sent once (reports.last_sent_period), so a late or repeated run is harmless.
+    { name: "reports", everyMs: 15 * MIN, run: (m) => m.reports.sendDue() },
+    // ---- AI answer visibility: ask every due question on every configured answer engine (daily/weekly per question).
+    { name: "ai-visibility", everyMs: 60 * MIN, run: (m) => runVisibility(m) },
   ];
 }
 

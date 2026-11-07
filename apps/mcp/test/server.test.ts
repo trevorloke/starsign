@@ -6,7 +6,7 @@ import { INSTRUCTIONS, SERVER_NAME, SERVER_VERSION, createServer } from "../src/
 import { TOOL_NAMES } from "../src/tools.ts";
 import { NOW, fakeApi, pendingDetail, radar, textOf } from "./helpers.ts";
 
-const WRITE_TOOLS = new Set(["create_post", "schedule_post", "cancel_post", "create_experiment", "create_link", "track_entity"]);
+const WRITE_TOOLS = new Set(["create_post", "schedule_post", "cancel_post", "create_experiment", "create_link", "track_entity", /* inbox workflow */ "update_inbox_item"]);
 
 let cleanup: (() => Promise<void>) | undefined;
 afterEach(async () => {

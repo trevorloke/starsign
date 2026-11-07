@@ -1,8 +1,9 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import type { ActivityInput, ActivityKind, Media, MetricInput, MetricName, Network } from "@starsign/schema";
 import { z } from "zod";
-import { asNetworkError, classifyHttpStatus, downloadMedia, isAfter, readJson, resolveFetch, type FetchLike } from "./http.ts";
+import { asNetworkError, classifyHttpStatus, isAfter, readJson, resolveFetch, type FetchLike } from "./http.ts";
 import { IdempotencyCache } from "./idempotency.ts";
+import { mediaSource, sendBody, withMedia, type StreamBody } from "./media-io.ts";
 import { OAuth2Client, clientFromEnv } from "./oauth.ts";
 import type {
   AccountIdentity,
@@ -611,26 +612,30 @@ export class MetaConnector implements Connector {
   private async resumableUpload(auth: MetaAuth, media: Media): Promise<string> {
     this.requireApp("resumable upload");
     if (!auth.userAccessToken) throw new ConnectorError("facebook resumable upload needs the user access token on the account; reconnect the Page", "auth", false);
-    const { bytes, mime } = this.media ? await this.media.fetch(media) : await downloadMedia(resolveFetch(this.fetchImpl), media);
-    const session = await this.graph<{ id?: string }>("POST", `/${this.clientId}/uploads`, auth.userAccessToken, {
-      query: { file_name: `starsign-${Date.now()}.mp4`, file_length: bytes.length, file_type: mime },
-      what: "upload session",
-      creating: true,
-    });
-    if (!session.id) throw new ConnectorError("facebook upload session: no id", "unknown", false, session);
-    let offset = 0;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        const res = (await this.rawRequest("POST", `${this.graphBase}/${this.version}/${session.id}`, { authorization: `OAuth ${auth.userAccessToken}`, file_offset: String(offset) }, new Blob([bytes.subarray(offset)]), "upload bytes")) as { h?: string };
-        if (res.h) return res.h;
-        throw new ConnectorError("facebook upload: response carried no file handle", "unknown", false, res);
-      } catch (err) {
-        if (!(err instanceof ConnectorError) || err.kind !== "network" || attempt === 2) throw err;
-        const s = (await this.rawRequest("GET", `${this.graphBase}/${this.version}/${session.id}`, { authorization: `OAuth ${auth.userAccessToken}` }, undefined, "upload offset")) as { file_offset?: number };
-        offset = Number(s.file_offset ?? 0);
+    const token = auth.userAccessToken;
+    // The bytes from file_offset on go up as one streamed body (exact Content-Length), so the video is never held whole.
+    return withMedia(mediaSource(this.media, this.fetchImpl), media, async (file) => {
+      const session = await this.graph<{ id?: string }>("POST", `/${this.clientId}/uploads`, token, {
+        query: { file_name: `starsign-${Date.now()}.mp4`, file_length: file.size, file_type: file.mime },
+        what: "upload session",
+        creating: true,
+      });
+      if (!session.id) throw new ConnectorError("facebook upload session: no id", "unknown", false, session);
+      let offset = 0;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const body = file.bytes ? new Blob([file.bytes.subarray(offset)]) : file.body(offset, file.size - offset, "application/octet-stream");
+          const res = (await this.rawRequest("POST", `${this.graphBase}/${this.version}/${session.id}`, { authorization: `OAuth ${token}`, file_offset: String(offset) }, body, "upload bytes")) as { h?: string };
+          if (res.h) return res.h;
+          throw new ConnectorError("facebook upload: response carried no file handle", "unknown", false, res);
+        } catch (err) {
+          if (!(err instanceof ConnectorError) || err.kind !== "network" || attempt === 2) throw err;
+          const s = (await this.rawRequest("GET", `${this.graphBase}/${this.version}/${session.id}`, { authorization: `OAuth ${token}` }, undefined, "upload offset")) as { file_offset?: number };
+          offset = Number(s.file_offset ?? 0);
+        }
       }
-    }
-    throw new ConnectorError("facebook upload: gave up", "network", true);
+      throw new ConnectorError("facebook upload: gave up", "network", true);
+    });
   }
 
   private async publishInstagram(account: AccountRef, auth: MetaAuth, input: PublishInput): Promise<PublishResult> {
@@ -1067,10 +1072,10 @@ export class MetaConnector implements Connector {
     return data as T;
   }
 
-  private async rawRequest(method: "GET" | "POST", url: string, headers: Record<string, string>, body: Blob | undefined, what: string): Promise<unknown> {
+  private async rawRequest(method: "GET" | "POST", url: string, headers: Record<string, string>, body: Blob | StreamBody | undefined, what: string): Promise<unknown> {
     let res: Response;
     try {
-      res = await resolveFetch(this.fetchImpl)(url, { method, headers, ...(body ? { body } : {}) });
+      res = await sendBody(resolveFetch(this.fetchImpl), url, { method, headers }, body);
     } catch (err) {
       throw asNetworkError(err, `meta ${what}`);
     }

@@ -1,8 +1,9 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import type { ActivityInput, Media, MetricInput, MetricName, Network, VariantOptions } from "@starsign/schema";
 import { z } from "zod";
-import { asNetworkError, classifyHttpStatus, downloadMedia, isAfter, readJson, resolveFetch, type FetchLike } from "./http.ts";
+import { asNetworkError, classifyHttpStatus, isAfter, readJson, resolveFetch, type FetchLike } from "./http.ts";
 import { IdempotencyCache } from "./idempotency.ts";
+import { mediaSource, rangeBody, sendBody, withMedia } from "./media-io.ts";
 import { OAuth2Client, type OAuth2Token } from "./oauth.ts";
 import type {
   AccountIdentity,
@@ -423,28 +424,33 @@ export class TikTokConnector implements Connector {
       if (!data.publish_id) throw new ConnectorError("tiktok video/init: no publish_id", "unknown", false, data);
       return data.publish_id;
     }
-    const { bytes, mime } = this.media ? await this.media.fetch(video) : await downloadMedia(resolveFetch(this.fetchImpl), video);
-    if (bytes.length > TIKTOK_LIMITS.maxVideoBytes) throw new ConnectorError("tiktok publish: video exceeds 4 GB", "rejected", false);
-    const chunks = tiktokChunkPlan(bytes.length);
-    const data = await this.api<{ publish_id?: string; upload_url?: string }>(auth.accessToken, "POST", "/v2/post/publish/video/init/", {
-      what: "video/init",
-      json: { post_info, source_info: { source: "FILE_UPLOAD", video_size: bytes.length, chunk_size: chunks.chunkSize, total_chunk_count: chunks.totalChunks } },
-    });
-    if (!data.publish_id || !data.upload_url) throw new ConnectorError("tiktok video/init: no publish_id/upload_url", "unknown", false, data);
-    for (const r of chunks.ranges) {
-      let res: Response;
-      try {
-        res = await resolveFetch(this.fetchImpl)(data.upload_url, {
-          method: "PUT",
-          headers: { "content-type": mime || "video/mp4", "content-range": `bytes ${r.start}-${r.end}/${bytes.length}` },
-          body: bytes.subarray(r.start, r.end + 1),
-        });
-      } catch (err) {
-        throw asNetworkError(err, "tiktok video upload");
+    // Each chunk (up to 64 MB, the last up to ~2x chunk_size) is sent as a streamed body read piece by piece, so
+    // neither the file nor a whole chunk is held in memory.
+    return withMedia(mediaSource(this.media, this.fetchImpl), video, async (file) => {
+      const mime = file.mime;
+      if (file.size > TIKTOK_LIMITS.maxVideoBytes) throw new ConnectorError("tiktok publish: video exceeds 4 GB", "rejected", false);
+      const chunks = tiktokChunkPlan(file.size);
+      const data = await this.api<{ publish_id?: string; upload_url?: string }>(auth.accessToken, "POST", "/v2/post/publish/video/init/", {
+        what: "video/init",
+        json: { post_info, source_info: { source: "FILE_UPLOAD", video_size: file.size, chunk_size: chunks.chunkSize, total_chunk_count: chunks.totalChunks } },
+      });
+      if (!data.publish_id || !data.upload_url) throw new ConnectorError("tiktok video/init: no publish_id/upload_url", "unknown", false, data);
+      for (const r of chunks.ranges) {
+        let res: Response;
+        try {
+          res = await sendBody(
+            resolveFetch(this.fetchImpl),
+            data.upload_url,
+            { method: "PUT", headers: { "content-type": mime || "video/mp4", "content-range": `bytes ${r.start}-${r.end}/${file.size}` } },
+            rangeBody(file, r.start, r.end + 1 - r.start, mime || "video/mp4"),
+          );
+        } catch (err) {
+          throw asNetworkError(err, "tiktok video upload");
+        }
+        if (!res.ok) throw mapTikTokError(res.status, await readJson(res), `video upload bytes ${r.start}-${r.end}`);
       }
-      if (!res.ok) throw mapTikTokError(res.status, await readJson(res), `video upload bytes ${r.start}-${r.end}`);
-    }
-    return data.publish_id;
+      return data.publish_id;
+    });
   }
 
   /** Photo posts are PULL_FROM_URL only: every image URL must be on a domain verified in the developer portal. */

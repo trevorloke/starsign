@@ -8,11 +8,14 @@ import type { CoreContext, Principal } from "../context.ts";
 import { CoreError } from "../errors.ts";
 import { mp4DurationFromRanges, mp4DurationSeconds, probe } from "../media/probe.ts";
 import type { MediaStorage } from "../media/storage.ts";
+import { sliceStream } from "../media/streams.ts";
 
 /**
- * Uploads are held in memory while they are checked and stored, so the cap must fit the instance. The default
- * (100 MB) is safe on a 512 MB instance; raise STARSIGN_MAX_UPLOAD_MB on bigger machines. With S3 storage, larger
- * files go straight to the bucket (createDirectUpload / completeDirectUpload) and never pass through the API.
+ * Uploads through the API (POST /v1/media) are held in memory while they are checked and stored, so the cap must fit
+ * the instance. The default (100 MB) is safe on a 512 MB instance; raise STARSIGN_MAX_UPLOAD_MB on bigger machines.
+ * With S3 storage, larger files go straight to the bucket (createDirectUpload / completeDirectUpload) and never pass
+ * through the API. Publishing does not load them either: the fetcher below serves sizes, ranges and streams, and
+ * upload-style connectors send videos chunk by chunk or as a streamed request body (see docs/integrations/README.md).
  */
 export const MAX_UPLOAD_BYTES = Math.max(1, Number(process.env.STARSIGN_MAX_UPLOAD_MB ?? 100)) * 1024 * 1024;
 export const MEDIA_LIMITS = {
@@ -122,7 +125,7 @@ export class MediaService {
   async completeDirectUpload(p: Principal, input: { uploadId: string; alt?: string }): Promise<MediaRow> {
     if (p.actor.type === "human" && p.role === "viewer") throw new CoreError("forbidden", "viewers cannot upload media");
     const { head, getRange } = this.storage;
-    if (!head || !getRange) throw new CoreError("unavailable", "direct uploads need S3-compatible storage");
+    if (!this.storage.presignPut || !head || !getRange) throw new CoreError("unavailable", "direct uploads need S3-compatible storage");
     let t: DirectTicket;
     try {
       t = this.ctx.secrets.decrypt<DirectTicket>(input.uploadId);
@@ -205,18 +208,107 @@ export class MediaService {
     };
   }
 
-  /** Bytes for connectors: from storage when the item is ours, else by URL. */
+  /**
+   * Bytes for connectors: from storage when the item is ours, else by URL. `fetch` returns the whole file (images,
+   * small files); `size`, `range` and `stream` let connectors upload a large video without holding it: positional
+   * reads on local disk, ranged GETs and a streamed GET on S3, and for external URLs HEAD + Range when the server
+   * supports ranges, else one streamed GET.
+   */
   fetcher(fetchImpl: typeof fetch = (i, init) => globalThis.fetch(i, init)): MediaFetcher {
+    const storage = this.storage;
+    // Asset rows by id: a chunked upload asks for many ranges of the same file.
+    const rows = new Map<string, { key: string; mime: string; bytes: number } | null>();
+    const asset = async (media: Media) => {
+      if (!media.assetId) return null;
+      const hit = rows.get(media.assetId);
+      if (hit !== undefined) return hit;
+      const [row] = await this.ctx.db.select().from(mediaAssets).where(eq(mediaAssets.id, media.assetId)).limit(1);
+      const found = row ? { key: row.storageKey, mime: row.mime, bytes: row.bytes } : null;
+      if (rows.size >= 1000) rows.clear();
+      rows.set(media.assetId, found);
+      return found;
+    };
     return {
       fetch: async (media) => {
-        if (media.assetId) {
-          const [row] = await this.ctx.db.select().from(mediaAssets).where(eq(mediaAssets.id, media.assetId)).limit(1);
-          if (row) return { bytes: await this.storage.get(row.storageKey), mime: row.mime };
-        }
+        const a = await asset(media);
+        if (a) return { bytes: await storage.get(a.key), mime: a.mime };
         const res = await fetchImpl(media.url);
         if (!res.ok) throw new Error(`media ${media.url}: HTTP ${res.status}`);
         return { bytes: new Uint8Array(await res.arrayBuffer()), mime: res.headers.get("content-type") ?? media.mime ?? "application/octet-stream" };
       },
+      size: async (media) => {
+        const a = await asset(media);
+        // Without ranged reads the reader streams instead, so report no size.
+        if (a) return storage.getRange ? a.bytes : null;
+        return remoteSize(fetchImpl, media.url);
+      },
+      range: async (media, start, length) => {
+        const a = await asset(media);
+        if (a) {
+          if (storage.getRange) return storage.getRange(a.key, start, length);
+          return (await storage.get(a.key)).slice(start, start + length);
+        }
+        return remoteRange(fetchImpl, media.url, start, length);
+      },
+      stream: async (media) => {
+        const a = await asset(media);
+        if (a) {
+          if (storage.stream) return { ...(await storage.stream(a.key)), mime: a.mime };
+          const bytes = await storage.get(a.key);
+          return { body: new Blob([bytes]).stream() as ReadableStream<Uint8Array>, size: bytes.byteLength, mime: a.mime };
+        }
+        const res = await fetchImpl(media.url);
+        if (!res.ok) {
+          await res.body?.cancel().catch(() => undefined);
+          throw new Error(`media ${media.url}: HTTP ${res.status}`);
+        }
+        return { body: res.body ?? new Blob([]).stream(), size: plainLength(res.headers), mime: res.headers.get("content-type") ?? media.mime ?? "application/octet-stream" };
+      },
     };
   }
+}
+
+/** Content-Length when it describes the bytes fetch will hand over (not a compressed transfer). */
+function plainLength(h: Headers): number | null {
+  const enc = h.get("content-encoding");
+  if (enc && enc.toLowerCase() !== "identity") return null;
+  const len = h.get("content-length");
+  return len !== null && /^\d+$/.test(len) ? Number(len) : null;
+}
+
+/** An external file's size, only when the server says it serves byte ranges; null means "stream it instead". */
+async function remoteSize(fetchImpl: typeof fetch, url: string): Promise<number | null> {
+  let res: Response;
+  try {
+    res = await fetchImpl(url, { method: "HEAD" });
+  } catch {
+    return null;
+  }
+  await res.body?.cancel().catch(() => undefined);
+  if (!res.ok) return null;
+  if (!/\bbytes\b/i.test(res.headers.get("accept-ranges") ?? "")) return null;
+  return plainLength(res.headers);
+}
+
+/** Bytes [start, start + length) of an external file: a Range GET, or the part of a full GET when Range is ignored. */
+async function remoteRange(fetchImpl: typeof fetch, url: string, start: number, length: number): Promise<Uint8Array> {
+  if (length <= 0) return new Uint8Array();
+  const res = await fetchImpl(url, { headers: { range: `bytes=${start}-${start + length - 1}` } });
+  if (res.status === 416) {
+    await res.body?.cancel().catch(() => undefined);
+    return new Uint8Array();
+  }
+  if (!res.ok) {
+    await res.body?.cancel().catch(() => undefined);
+    throw new Error(`media ${url}: HTTP ${res.status}`);
+  }
+  if (res.status === 206) {
+    const from = /^bytes (\d+)-/i.exec(res.headers.get("content-range") ?? "");
+    if (from && Number(from[1]) !== start) {
+      await res.body?.cancel().catch(() => undefined);
+      throw new Error(`media ${url}: asked for bytes from ${start}, got from ${from[1]}`);
+    }
+    return sliceStream(res.body, 0, length);
+  }
+  return sliceStream(res.body, start, length);
 }

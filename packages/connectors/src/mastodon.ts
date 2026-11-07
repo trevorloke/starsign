@@ -1,8 +1,9 @@
 import type { ActivityInput, ActivityKind, Media, MetricInput, MetricName, Network } from "@starsign/schema";
 import { z } from "zod";
-import { asNetworkError, classifyHttpStatus, downloadMedia, isAfter, readJson, resolveFetch, type FetchLike } from "./http.ts";
+import { asNetworkError, classifyHttpStatus, isAfter, readJson, resolveFetch, type FetchLike } from "./http.ts";
 import { IdempotencyCache } from "./idempotency.ts";
 import { OAuth2Client } from "./oauth.ts";
+import { mediaSource, sendBody, setMediaFile, uploadForm, withUpload, type StreamingForm } from "./media-io.ts";
 import type { AccountIdentity, AccountRef, ConnectedAccount, Connector, ConnectorCapabilities, MediaFetcher, ModerationInput, PublishInput, PublishResult, ValidationIssue } from "./types.ts";
 import { ConnectorError } from "./types.ts";
 
@@ -323,11 +324,13 @@ export class MastodonConnector implements Connector {
       items = [];
       for (const m of media) {
         if (m.kind === "document") continue;
-        const { bytes, mime } = this.media ? await this.media.fetch(m) : await downloadMedia(resolveFetch(this.fetchImpl), m);
-        const form = new FormData();
-        form.set("file", new Blob([bytes], { type: mime }), `upload.${mime.split("/")[1] ?? "bin"}`);
-        if (m.alt) form.set("description", m.alt.slice(0, 1500));
-        const res = (await this.call(account, auth, "POST", "/api/v2/media", { form, writing: true })) as MastodonMedia;
+        // Videos go up as a streamed multipart body (exact Content-Length), so the file is never held whole.
+        const res = await withUpload(mediaSource(this.media, this.fetchImpl), m, async (file) => {
+          const form = uploadForm([file]);
+          setMediaFile(form, "file", file, `upload.${file.mime.split("/")[1] ?? "bin"}`);
+          if (m.alt) form.set("description", m.alt.slice(0, 1500));
+          return (await this.call(account, auth, "POST", "/api/v2/media", { form, writing: true })) as MastodonMedia;
+        });
         if (!res?.id) throw new ConnectorError("mastodon media: upload returned no id", "unknown", false, res);
         items.push(res);
       }
@@ -480,14 +483,14 @@ export class MastodonConnector implements Connector {
     for (const [k, vs] of Object.entries(opts.query ?? {})) for (const v of vs) url.searchParams.append(k, v);
     const headers: Record<string, string> = { accept: "application/json", ...(opts.headers ?? {}) };
     if (token) headers.authorization = `Bearer ${token}`;
-    let body: string | FormData | undefined;
+    let body: string | FormData | StreamingForm | undefined;
     if (opts.json !== undefined) {
       headers["content-type"] = "application/json";
       body = JSON.stringify(opts.json);
     } else if (opts.form) body = opts.form;
     let res: Response;
     try {
-      res = await resolveFetch(this.fetchImpl)(url.toString(), { method, headers, body });
+      res = await sendBody(resolveFetch(this.fetchImpl), url.toString(), { method, headers }, body);
     } catch (err) {
       throw asNetworkError(err, `mastodon ${method} ${path} (${who ?? instance})`);
     }
@@ -500,7 +503,7 @@ export class MastodonConnector implements Connector {
 interface RequestOpts {
   query?: Record<string, string[]>;
   json?: unknown;
-  form?: FormData;
+  form?: FormData | StreamingForm;
   headers?: Record<string, string>;
   writing?: boolean;
 }

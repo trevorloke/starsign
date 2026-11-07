@@ -282,3 +282,135 @@ candidate, spokesperson, creator, an individual's own brand). A person or sub-br
 - The web app has a Settings drawer for the brand profile (PATCH /v1/workspace/profile), red lines, autonomy,
   timezone and spend caps (PUT /v1/policy), and policy history.
 
+
+## Analytics and client reports (v1.6)
+<!-- ---- analytics & client reports -->
+- `GET /v1/analytics?from&to&networks=x,bluesky&accounts=<id,id>` (default: the last 30 days; at most 366 days; anyone
+  in the workspace) → one payload for the Analytics view:
+  `{ window: { from, to, previousFrom, previousTo, days, timezone }, filters, totals, previous, change, currency,
+  byNetwork[], byAccount[], topPosts[], bestTimes, whatWorked, series[], previousSeries[], mentions, measured }`.
+  - `totals` / `previous` (the equal period just before) / each `byNetwork` and `byAccount` row:
+    `{ posts, impressions, engagements, engagementRate, linkClicks, conversions, conversionValue, followersGained, mentions }`.
+    A post's numbers are its 72h outcome snapshot, else its 24h one, else its latest metrics; engagements are the
+    network's `engagements`, else likes + replies + reposts + quotes + shares + saves; engagement rate is over posts
+    that reported impressions. Link clicks are non-bot clicks on Starsign short links; followers gained comes from the
+    accounts' `followers_total` series; mentions are mention/reply/comment/quote items the accounts received.
+    `change[k]` is fractional (0.12 = +12%), null when the previous value was 0.
+  - `topPosts` (10, by engagements): `{ postId, variantIds, text, networks, url, publishedAt, impressions, engagements,
+    engagementRate, linkClicks, conversions, basis: "72h" | "24h" | "latest" }`.
+  - `bestTimes` (posts from the last 90 days, at least): 168 `cells` `{ weekday (0 = Monday), hour, posts, medianRate, thin }`
+    of median engagement rate at 24h by local weekday × hour of publish in the workspace's time zone; `thin` = fewer
+    than 3 posts (never recommended); `recommendation` is a sentence ("Tuesdays and Thursdays 9–11am have done best;
+    based on 42 posts.").
+  - `whatWorked`: `comparisons` (rode a trend vs not, images or video vs none, short (< 120 characters) vs longer, and
+    each post kind vs the rest) as `{ id, label, a, b, ratio, verdict: better|worse|similar|not_enough, sentence }`
+    using median engagements at 24h; fewer than 5 posts on either side is always `not_enough`. `stages` is
+    `GET /v1/metrics/lift-by-stage` for the same window.
+  - `series` / `previousSeries`: per local day `{ day, impressions, engagements (by the day posts went out), clicks,
+    followers (end of day) }`.
+- Reports: `{ id, name, period: last_7_days|last_30_days|calendar_month, sections[], branding: { title, clientName,
+  logoMediaId, logoUrl, accent }, recipients[], schedule: { kind: "none" } | { kind: "weekly", weekday 0-6 (Monday = 0),
+  hour } | { kind: "monthly", day 1-28, hour }, scheduleSummary, nextSendAt, filters: { networks, accounts }, intro,
+  lastSentAt, lastSentPeriod, shares: { active, lastCreatedAt }, createdBy, createdAt, updatedAt }`.
+  Sections: `summary, by_network, top_posts, best_times, links, tracker, mentions, what_worked, upcoming`. Periods are
+  whole local days that have ended (a calendar month is the last complete one). The logo must be an image in this
+  workspace's media library.
+  - `GET /v1/reports`, `GET /v1/reports/:id` (anyone in the workspace).
+  - `POST /v1/reports` → `201`, `PATCH /v1/reports/:id`, `DELETE /v1/reports/:id` → `204` (also turns off its links).
+    People with owner/approver/editor manage reports; agent keys may PATCH anything but `recipients` (`403`); viewers
+    read and render only.
+  - `GET /v1/reports/:id/render?format=html` → a self-contained, printable HTML document (inline CSS and SVG, no
+    scripts, nothing loaded but the logo; a print stylesheet keeps sections on one page where they fit: "Save as PDF"
+    from the browser). Served with `content-security-policy: default-src 'none'; style-src 'unsafe-inline'; img-src …`.
+  - `POST /v1/reports/preview` body = a report definition → the same HTML without saving (the editor's live preview).
+  - `POST /v1/reports/:id/send` → `{ sent, period, periodLabel, viewUrl }`: emails every recipient now (HTML body,
+    plain-text alternative, and a fresh read-only link). People editor+ and agents; `503` without mail
+    (RESEND_API_KEY + MAIL_FROM), `400` without recipients. Ledger: `report.sent`.
+  - `POST /v1/reports/:id/share` → `201 { id, url, createdAt }`: a new read-only link `<public url>/r/<token>`; the
+    token is 32 random bytes shown once, stored only as its sha256. `DELETE /v1/reports/:id/share` → `204` turns off
+    every link to the report (emailed ones too). Editor+ people only. Ledger: `report.shared`, `report.share_revoked`.
+  - Public `GET /r/:token` (no session, no key): the latest version of the report for its current period, read-only,
+    `no-store`, never framed or indexed; `404` once revoked or deleted.
+- Scheduling: the workers' `reports` job (every 15 minutes) emails each scheduled report whose latest moment (in the
+  workspace's time zone) has passed and came after the report was created, once per period: the period key is
+  claimed in `reports.last_sent_period` before mailing and released if mailing fails. Without mail it does nothing.
+- `MailMessage` gained an optional `html`; Resend receives it alongside `text`.
+
+<!-- ---- AI answer visibility -->
+## AI answer visibility
+What AI assistants say when people ask the questions a workspace cares about. See `docs/visibility.md` for what is
+measured, its limits, keys and costs. Viewers and agent keys read everything; people with editor or above manage
+questions, run them and set each tracked name's own sites; owners choose the engines and which cadences are allowed.
+- `GET /v1/visibility/engines` → `{ id: "anthropic"|"openai"|"perplexity"|"gemini"|"fake", label, configured, enabled, envVar, modelEnvVar, model, priced }[]`
+  (`configured`: this server has the key; `enabled`: configured and not turned off for the workspace; `priced`: the call's cost is known and counted).
+- `GET /v1/visibility/settings` → `{ settings: { engines: string[] | null, cadences: ("daily"|"weekly")[], maxPrompts, domains: { [entityId]: string[] } }, engines, judge: boolean }`.
+  `PATCH` with any of those fields: `engines` (null = every configured engine), `cadences`, `maxPrompts` are owner only;
+  `domains` (a tracked name's own web domains; an empty list clears them) is editor and up. Ledger: `visibility.settings_updated`.
+- `GET /v1/visibility/prompts` (`?archived=1`) → `Prompt[]` = `{ id, question, translations: { [lang]: string }, languages, regions, entityIds, cadence, notes, lastSlot, lastRunAt, createdAt, updatedAt, archivedAt, due }`.
+- `POST /v1/visibility/prompts` body `{ question (3-500), languages = ["en"] (1-6), translations?, regions? (ISO country codes, ≤ 6), entityIds? (empty = every tracked name), cadence = "weekly", notes? }` → `201 Prompt`.
+  `400` for a cadence an owner turned off or an untracked name; `409` past `maxPrompts`. `GET|PATCH|DELETE /v1/visibility/prompts/:id` (DELETE archives; answers stay).
+  Ledger: `visibility.prompt_created|prompt_updated|prompt_archived`.
+- `POST /v1/visibility/prompts/:id/run` → `{ runId, prompts, answers, errors, capped, mentions, costUsd }`: asks every enabled engine, in every
+  language and region, now. Counts for the current day or week, so the hourly job does not ask again. `503` without an engine.
+- `POST /v1/visibility/suggest` body `{ languages?, count = 8 }` → `{ languages, questions: { question, lang, why, names }[] }`. Suggestions only;
+  `503` without a model or past the monthly model spend cap.
+- `GET /v1/visibility/report?from&to` (default 28 days) → `{ from, to, previous: { from, to }, totals: { answers, prompts, errors, capped, costUsd, byEngine[], byLanguage[] },
+  entities: Row[], citations: { total, own, ownShare, ownDomains[], otherDomains[] }, latest: Answer[], engines }`.
+  `Row = { id, name, kind, role, relation, parentId, answers, mentioned, share (0..1), avgPosition, sentiment (-1..1), ownCitations, flagged, previous: Agg, change: { share, avgPosition, sentiment }, byEngine: Agg[], byLanguage: Agg[], trend: (Agg & { day })[] }`
+  where `answers` counts the successful answers in which the name was looked for; `previous` is the same length of time just before `from`.
+  Domains: `{ domain, citations, answers, ownerEntityId }`.
+- `GET /v1/visibility/answers?promptId&engine&entity&mentioned=0&lang&from&to&limit` → `Answer[]` newest first:
+  `{ id, promptId, prompt, question (as sent), engine, model, lang, region, status: ok|error|capped, text, error, citations: { url, title, domain, ownerEntityId }[], costUsd, askedAt,
+  mentions: { entityId, name, mentioned, position, term, sentiment, summary, flags[], ownCitations }[], highlights: { start, end, entityId }[] }`.
+  With `entity`, answers that name it (or, with `mentioned=0`, that leave it out).
+- Background: the workers' `ai-visibility` job (hourly) asks every due question (once per UTC day or ISO week), at most 60 engine
+  calls per workspace per hour, as a "visibility" operator run within the model spend cap; past the cap the remaining answers are
+  recorded `capped`. Each run writes `ai_answer_mentions` and `ai_answer_citations` metrics per tracked name (`entityType: "tracked_entity"`).
+- MCP: `get_ai_visibility` (read only).
+<!-- ---- end AI answer visibility -->
+
+<!-- ---- inbox workflow -->
+## Team inbox
+The live feed worked as a shared inbox. Every inbound message that came in through a connected account is part of a
+conversation (own posts, likes, follows and reposts are not; nor is what the tracker's public search found). A reply
+with a parent id, or a direct message with a conversation id, joins the conversation it belongs to; the conversation's
+state lives on its first message, whose activity id is the item's id. A new message in a done or pending conversation
+reopens it. Activities stay exactly as ingested; the state is in `inbox_items` (migration `0011_inbox.sql`, which also
+backfills: messages from the last 7 days start open, older ones done).
+
+Roles: viewers and agent keys read everything. People with editor or above work items (status, assignee, priority,
+labels, snooze), write notes and manage saved replies. Owners and approvers manage labels, rules and response targets.
+Agent keys may change status and labels and add notes, but never assign, set priority, snooze or touch rules (`403`).
+Every change is a ledger event.
+
+- `GET /v1/inbox?status=open,pending&assignee=me|none|<userId>&tag=&priority=urgent,high&network=x,line&q=&sort=newest|oldest|due|priority&snoozed=1&limit=50&offset=0`
+  → `{ items: Entry[], counts: { open, pending, done, spam, mine, unassigned, snoozed }, viewer: { userId, canWork, canAssign, canManage } }`.
+  `Entry = { activity: Activity (the first message), latest: Activity | null, state: { status, assignee, priority, tags, firstResponseAt, doneAt, snoozedUntil, slaDueAt, lastActivityAt, messageCount, createdAt, updatedAt }, sla: { dueAt, state: none|ok|soon|overdue|met|missed, msLeft, targetMinutes }, notes }`.
+  Snoozed conversations are left out unless `snoozed=1`. Counts follow every filter except status and assignee: `mine` is open or pending and
+  assigned to the caller, `unassigned` is open with nobody on it, open/pending exclude snoozed ones. `due` sorts by the first-response deadline
+  of conversations still waiting on one.
+- `GET /v1/inbox/:activityId` (any message of the conversation) → `{ item: Entry, messages: Activity[] (oldest first), parent: Activity | null (the post it answers), replies: { postId, status, text, replyTo, network, createdAt, createdBy, publishedAt }[], notes: Note[] }`.
+- `PATCH /v1/inbox/:activityId` body any of `{ status: open|pending|done|spam, assignee: userId|"me"|null, priority: normal|high|urgent, tags: string[], addTags, removeTags, snoozedUntil: ISO|null }` → `Entry`.
+  Labels must be the workspace's; an assignee must be a member with editor or above. Done sets `doneAt`; done and spam wake a snooze. Ledger: `inbox.item_updated` with the changes.
+- `PATCH /v1/inbox` body `{ ids: string[] (1-200), patch }` → `{ updated, items: Entry[] }` (ledger events carry `bulk: true`).
+- Notes: `GET /v1/inbox/:activityId/notes` → `Note[]` = `{ id, threadId, author, text, mentions: userId[], createdAt, editedAt }`; `POST` body `{ text, mentions? }` → `201 Note`;
+  `PATCH /v1/inbox/notes/:noteId` `{ text }` (the author only); `DELETE` (the author or an owner). `@sam`, `@ana.ruiz`, `@AnaRuiz` mention a member by email name,
+  first name or full name. Each person mentioned gets an `inbox` live event and an `inbox.mentioned` ledger event (subject: the user). Ledger: `inbox.note_added|note_updated|note_deleted`.
+- Saved replies: `GET /v1/saved-replies` → `{ id, name, text, lang, createdBy, createdAt, updatedAt }[]`; `POST` `{ name, text, lang? }`; `PATCH|DELETE /v1/saved-replies/:id`.
+  `POST /v1/saved-replies/:id/fill` `{ activityId }` → `{ text, lang }` with `{{author_name}}`, `{{author_handle}}`, `{{brand}}` filled in one pass (a value is never
+  re-expanded; `\{{x}}` stays literal; unknown variables stay for the person to edit). Nothing is sent: the text goes into the reply box and the reply goes through
+  `POST /v1/feed/:id/reply` and the gate (red lines and the reply autonomy dial) as before. Ledger: `inbox.saved_reply_created|updated|deleted`.
+- Rules: `GET /v1/inbox/rules`; `POST` `{ name, enabled?, conditions: { streams, entities, networks, kinds, languages, keywords }, actions: { assignee? | roundRobin?: userId[], tags?, priority?, spam? } }`;
+  `PATCH|DELETE /v1/inbox/rules/:id`; `POST /v1/inbox/rules/reorder` `{ ids }`. Evaluated in order when a new conversation arrives (after the tracker scan,
+  so `entities` matches tracked names): empty condition groups match anything, values within a group are alternatives. For assignee, priority and spam
+  the first matching rule decides; labels from every matching rule add up. Round robin rotates among the listed members who can still work the inbox.
+  Ledger: `inbox.rule_created|rule_updated|rule_deleted`, and `inbox.rule_applied` per rule that changed a conversation.
+- Settings: `GET /v1/inbox/settings` → `{ sla: { urgent, high, normal } (minutes; default 15, 60, 480), businessHours: { enabled, days (0 = Sunday), start, end }, tags: { name, color: gray|blue|green|amber|red|violet }[], timezone }`;
+  `PATCH` with any of `sla`, `businessHours`, `tags`. With business hours on, the clock counts only those hours on those days, in the workspace's
+  timezone (the policy's). New targets apply to conversations still waiting on a first reply; a label taken off the list comes off every conversation.
+  Ledger: `inbox.settings_updated`.
+- First response: a reply post on its way out (scheduled, approved, publishing or published) that answers a message in a conversation sets
+  `firstResponseAt` and moves an open conversation to pending. Ledger: `inbox.responded` (actor: who wrote the reply). A reply waiting on approval is not a response yet.
+- Live: the SSE stream gains `event: inbox`, `data: { workspaceId, kind: new|updated|assigned|mention|note|settings, ids?, userIds?, noteId? }`.
+- MCP: `list_inbox` (read) and `update_inbox_item` (status, labels, note; write).
+<!-- ---- end inbox workflow -->

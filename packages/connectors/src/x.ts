@@ -2,6 +2,7 @@ import type { ActivityInput, ActivityKind, Media, MetricInput, MetricName, Netwo
 import { z } from "zod";
 import { asNetworkError, classifyHttpStatus, downloadMedia, isAfter, isoSeconds, readJson, resolveFetch, type FetchLike } from "./http.ts";
 import { IdempotencyCache } from "./idempotency.ts";
+import { mediaSource, withMedia } from "./media-io.ts";
 import type { AccountRef, AuthRefresh, Connector, ConnectorCapabilities, MediaFetcher, ModerationInput, PublishInput, PublishResult, ValidationIssue } from "./types.ts";
 import { ConnectorError } from "./types.ts";
 
@@ -440,19 +441,22 @@ export class XConnector implements Connector {
    * command-style INIT/APPEND/FINALIZE on /2/media/upload in 2025; X's quickstart still shows the old form.
    */
   private async uploadChunked(account: AccountRef, auth: XAuth, m: Media): Promise<string> {
-    const { bytes, mime } = await this.bytesOf(m);
-    const category = m.kind === "gif" ? "tweet_gif" : "tweet_video";
-    const init = await this.request<{ data?: { id?: string } }>(account, auth, "POST", "/2/media/upload/initialize", { json: { media_type: mime, total_bytes: bytes.byteLength, media_category: category }, creating: true });
-    const id = init.data?.id;
-    if (!id) throw new ConnectorError("x media initialize: response carried no media id", "unknown", false, init);
-    for (let offset = 0, segment = 0; offset < bytes.byteLength; offset += this.chunkBytes, segment++) {
-      const form = new FormData();
-      form.set("segment_index", String(segment));
-      form.set("media", new Blob([bytes.subarray(offset, offset + this.chunkBytes)], { type: "application/octet-stream" }), "chunk");
-      await this.request(account, auth, "POST", `/2/media/upload/${id}/append`, { form, creating: true });
-    }
-    await this.request(account, auth, "POST", `/2/media/upload/${id}/finalize`, { creating: true });
-    return id;
+    // The file is read one segment at a time (ranged reads), so a large video never sits in memory whole.
+    return withMedia(mediaSource(this.media, this.fetchImpl), m, async (file) => {
+      const category = m.kind === "gif" ? "tweet_gif" : "tweet_video";
+      const init = await this.request<{ data?: { id?: string } }>(account, auth, "POST", "/2/media/upload/initialize", { json: { media_type: file.mime, total_bytes: file.size, media_category: category }, creating: true });
+      const id = init.data?.id;
+      if (!id) throw new ConnectorError("x media initialize: response carried no media id", "unknown", false, init);
+      let segment = 0;
+      for await (const chunk of file.chunks(this.chunkBytes)) {
+        const form = new FormData();
+        form.set("segment_index", String(segment++));
+        form.set("media", new Blob([chunk], { type: "application/octet-stream" }), "chunk");
+        await this.request(account, auth, "POST", `/2/media/upload/${id}/append`, { form, creating: true });
+      }
+      await this.request(account, auth, "POST", `/2/media/upload/${id}/finalize`, { creating: true });
+      return id;
+    });
   }
 
   /** TODO(verify): v2 alt text lives at POST /2/media/metadata with { id, metadata: { alt_text: { text } } }. */

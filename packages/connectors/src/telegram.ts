@@ -1,8 +1,9 @@
 import { timingSafeEqual } from "node:crypto";
 import type { ActivityInput, ActivityKind, Media, MetricInput, Network } from "@starsign/schema";
 import { z } from "zod";
-import { asNetworkError, downloadMedia, isAfter, readJson, resolveFetch, type FetchLike } from "./http.ts";
+import { asNetworkError, isAfter, readJson, resolveFetch, type FetchLike } from "./http.ts";
 import { IdempotencyCache } from "./idempotency.ts";
+import { StreamingForm, mediaSource, openForUpload, sendBody, setMediaFile, uploadForm, withUpload, type MediaReader } from "./media-io.ts";
 import type { AccountIdentity, AccountRef, ConnectedAccount, Connector, ConnectorCapabilities, MediaFetcher, ModerationInput, PublishInput, PublishResult, ValidationIssue, WebhookBatch, WebhookHandler } from "./types.ts";
 import { ConnectorError } from "./types.ts";
 
@@ -310,10 +311,12 @@ export class TelegramConnector implements Connector {
         if (!isUrlFetchFailure(err)) throw err;
       }
     }
-    const form = formOf({ ...base, ...caption, ...extra });
-    const file = await this.bytesOf(m);
-    form.set(field, new Blob([file.bytes], { type: file.mime }), fileName(m, file.mime, 0));
-    return this.api<TelegramMessage>(token, method, form);
+    // Videos and documents go up as a streamed multipart body (exact Content-Length); photos are read whole as before.
+    return withUpload(this.source(), m, async (file) => {
+      const form = formOf({ ...base, ...caption, ...extra }, [file]);
+      setMediaFile(form, field, file, fileName(m, file.mime, 0));
+      return this.api<TelegramMessage>(token, method, form);
+    });
   }
 
   private async sendGroup(token: string, base: Record<string, unknown>, media: Media[], caption: Record<string, unknown>): Promise<TelegramMessage[]> {
@@ -326,16 +329,19 @@ export class TelegramConnector implements Connector {
         if (!isUrlFetchFailure(err)) throw err;
       }
     }
-    const form = formOf({ ...base, media: items((_m, i) => `attach://file${i}`) });
-    for (const [i, m] of media.entries()) {
-      const file = await this.bytesOf(m);
-      form.set(`file${i}`, new Blob([file.bytes], { type: file.mime }), fileName(m, file.mime, i));
+    const files: MediaReader[] = [];
+    try {
+      for (const m of media) files.push(await openForUpload(this.source(), m));
+      const form = formOf({ ...base, media: items((_m, i) => `attach://file${i}`) }, files);
+      for (const [i, m] of media.entries()) setMediaFile(form, `file${i}`, files[i]!, fileName(m, files[i]!.mime, i));
+      return await this.api<TelegramMessage[]>(token, "sendMediaGroup", form);
+    } finally {
+      for (const f of files) await f.close();
     }
-    return this.api<TelegramMessage[]>(token, "sendMediaGroup", form);
   }
 
-  private bytesOf(m: Media): Promise<{ bytes: Uint8Array; mime: string }> {
-    return this.media ? this.media.fetch(m) : downloadMedia(resolveFetch(this.fetchImpl), m);
+  private source(): MediaFetcher {
+    return mediaSource(this.media, this.fetchImpl);
   }
 
   /** Where a reply goes: comments on a channel post are answered in its discussion-group copy when we know it. */
@@ -428,11 +434,15 @@ export class TelegramConnector implements Connector {
 
   // ---- transport ------------------------------------------------------------------------
 
-  private async api<T>(token: string, method: string, params: Record<string, unknown> | FormData): Promise<T> {
-    const init: RequestInit = params instanceof FormData ? { method: "POST", body: params } : { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(params) };
+  private async api<T>(token: string, method: string, params: Record<string, unknown> | FormData | StreamingForm): Promise<T> {
+    const url = `${this.apiBase}/bot${token}/${method}`;
     let res: Response;
     try {
-      res = await resolveFetch(this.fetchImpl)(`${this.apiBase}/bot${token}/${method}`, init);
+      if (params instanceof StreamingForm) res = await sendBody(resolveFetch(this.fetchImpl), url, { method: "POST" }, params);
+      else {
+        const init: RequestInit = params instanceof FormData ? { method: "POST", body: params } : { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(params) };
+        res = await resolveFetch(this.fetchImpl)(url, init);
+      }
     } catch (err) {
       // The URL holds the token; report only the method.
       throw asNetworkError(err instanceof Error ? new Error(err.message.replaceAll(token, "<token>")) : err, `telegram ${method}`);
@@ -448,8 +458,9 @@ function isUrlFetchFailure(err: unknown): boolean {
   return err instanceof ConnectorError && err.kind === "rejected" && /HTTP URL|wrong file|failed to get|wrong type of the web page/i.test(d);
 }
 
-function formOf(fields: Record<string, unknown>): FormData {
-  const form = new FormData();
+/** The fields as a form: a FormData, or a StreamingForm when a file in `files` is to be streamed. */
+function formOf(fields: Record<string, unknown>, files: MediaReader[] = []): FormData | StreamingForm {
+  const form = uploadForm(files);
   for (const [k, v] of Object.entries(fields)) if (v !== undefined) form.set(k, typeof v === "object" ? JSON.stringify(v) : String(v));
   return form;
 }

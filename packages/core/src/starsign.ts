@@ -20,6 +20,13 @@ import { EntityService } from "./services/entities.ts";
 import { EngagementService, WebhookService } from "./services/listening.ts";
 import { storageFromEnv } from "./media/storage.ts";
 import { AuthService } from "./services/auth.ts";
+// ---- inbox workflow
+import { InboxService } from "./services/inbox.ts";
+// ---- AI answer visibility
+import { VisibilityService } from "./services/visibility.ts";
+// ---- analytics & client reports
+import { AnalyticsService } from "./services/analytics.ts";
+import { ReportService } from "./services/reports.ts";
 
 /** The one object every front door (API, MCP, operators, workers) talks to. */
 export class Starsign {
@@ -45,6 +52,13 @@ export class Starsign {
   readonly engagement: EngagementService;
   readonly webhooks: WebhookService;
   readonly auth: AuthService;
+  // ---- inbox workflow
+  readonly inbox: InboxService;
+  // ---- AI answer visibility
+  readonly visibility: VisibilityService;
+  // ---- analytics & client reports
+  readonly analytics: AnalyticsService;
+  readonly reports: ReportService;
 
   constructor(deps: CoreDeps) {
     this.ctx = new CoreContext(deps);
@@ -72,6 +86,20 @@ export class Starsign {
     this.engagement = new EngagementService(this.ctx, this.posts, this.accounts);
     this.webhooks = new WebhookService(this.ctx, this.listening, this.accounts);
     this.auth = new AuthService(this.ctx, this.workspaces, deps.auth);
+    // ---- inbox workflow: new messages become conversations after the tracker has scanned them (rules can match entities).
+    this.inbox = new InboxService(this.ctx, this.policy);
+    this.listening.afterIngest.push((ws, ids) => this.inbox.onIngest(ws, ids));
+    // ---- end inbox workflow
+    // ---- AI answer visibility
+    this.visibility = new VisibilityService(this.ctx, this.entities, this.ops, this.policy);
+    // ---- analytics & client reports (reports mail through the same mailer as invites)
+    this.analytics = new AnalyticsService(this.ctx, this.policy, this.metrics, this.links);
+    this.reports = new ReportService(
+      this.ctx,
+      { analytics: this.analytics, policy: this.policy, links: this.links, entities: this.entities, posts: this.posts },
+      { mailer: deps.auth?.mailer, publicUrl: deps.auth?.publicUrl },
+    );
+    // ---- end analytics & client reports
     // Upload-style connectors read media bytes through the library.
     const fetcher = this.media.fetcher();
     for (const c of this.ctx.connectors.list()) c.media = fetcher;

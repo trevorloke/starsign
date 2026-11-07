@@ -5,6 +5,7 @@ export * from "./registry.ts";
 export * from "./mock.ts";
 export * from "./idempotency.ts";
 export * from "./http.ts";
+export * from "./media-io.ts";
 export * from "./bluesky.ts";
 export * from "./x.ts";
 export * from "./zernio.ts";

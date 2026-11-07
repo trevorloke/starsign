@@ -1,7 +1,8 @@
 import type { ActivityInput, ActivityKind, Media, MetricInput, Network } from "@starsign/schema";
 import { z } from "zod";
-import { asNetworkError, downloadMedia, readJson, resolveFetch, type FetchLike } from "./http.ts";
+import { asNetworkError, readJson, resolveFetch, type FetchLike } from "./http.ts";
 import { IdempotencyCache } from "./idempotency.ts";
+import { mediaSource, openForUpload, sendBody, setMediaFile, uploadForm, type MediaReader, type StreamingForm } from "./media-io.ts";
 import type { AccountIdentity, AccountRef, ConnectedAccount, Connector, ConnectorCapabilities, MediaFetcher, ModerationInput, PublishInput, PublishResult, ValidationIssue } from "./types.ts";
 import { ConnectorError } from "./types.ts";
 
@@ -397,26 +398,30 @@ export class DiscordBotConnector implements Connector {
       if (opts.link && !input.text.includes(opts.link)) {
         payload.embeds = [{ url: opts.link, title: (opts.title ?? opts.link).slice(0, 256), ...(opts.thumbnailUrl ? { thumbnail: { url: opts.thumbnailUrl } } : {}) }];
       }
-      let body: string | FormData;
+      let body: string | FormData | StreamingForm;
       const media = input.media.slice(0, LIMITS.files);
-      if (media.length > 0) {
-        const files = await Promise.all(media.map((m) => this.bytesOf(m)));
-        payload.attachments = media.map((m, i) => ({ id: i, filename: fileName(m, files[i]!.mime, i), ...(m.alt ? { description: m.alt.slice(0, 1024) } : {}) }));
-        const form = new FormData();
-        form.set("payload_json", JSON.stringify(payload));
-        media.forEach((m, i) => form.set(`files[${i}]`, new Blob([files[i]!.bytes], { type: files[i]!.mime }), fileName(m, files[i]!.mime, i)));
-        body = form;
-      } else {
-        body = JSON.stringify(payload);
+      // Videos and documents are opened for streaming; when any is, the multipart body is streamed with an exact
+      // Content-Length instead of being assembled in memory.
+      const files: MediaReader[] = [];
+      let msg: DiscordApiMessage;
+      try {
+        if (media.length > 0) {
+          for (const m of media) files.push(await openForUpload(mediaSource(this.media, this.fetchImpl), m));
+          payload.attachments = media.map((m, i) => ({ id: i, filename: fileName(m, files[i]!.mime, i), ...(m.alt ? { description: m.alt.slice(0, 1024) } : {}) }));
+          const form = uploadForm(files);
+          form.set("payload_json", JSON.stringify(payload));
+          media.forEach((m, i) => setMediaFile(form, `files[${i}]`, files[i]!, fileName(m, files[i]!.mime, i)));
+          body = form;
+        } else {
+          body = JSON.stringify(payload);
+        }
+        msg = await this.api<DiscordApiMessage>(botToken, "POST", `/channels/${channelId}/messages`, input.replyToExternalId ? "reply" : "create message", body);
+      } finally {
+        for (const f of files) await f.close();
       }
-      const msg = await this.api<DiscordApiMessage>(botToken, "POST", `/channels/${channelId}/messages`, input.replyToExternalId ? "reply" : "create message", body);
       if (!msg?.id) throw new ConnectorError("discord publish: response carried no message id", "unknown", false, msg);
       return { externalId: `${msg.channel_id ?? channelId}:${msg.id}`, url: discordMessageUrl(cfg.guildId, msg.channel_id ?? channelId, msg.id), raw: msg };
     });
-  }
-
-  private bytesOf(m: Media): Promise<{ bytes: Uint8Array; mime: string }> {
-    return this.media ? this.media.fetch(m) : downloadMedia(resolveFetch(this.fetchImpl), m);
   }
 
   // ---- engage ---------------------------------------------------------------------------
@@ -535,13 +540,14 @@ export class DiscordBotConnector implements Connector {
 
   // ---- transport ------------------------------------------------------------------------
 
-  private async api<T>(token: string, method: string, path: string, what: string, body?: string | FormData): Promise<T> {
+  private async api<T>(token: string, method: string, path: string, what: string, body?: string | FormData | StreamingForm): Promise<T> {
     const headers: Record<string, string> = { authorization: `Bot ${token}`, "user-agent": "DiscordBot (https://starsign.app, 1)" };
     if (typeof body === "string") headers["content-type"] = "application/json";
     for (let attempt = 0; ; attempt++) {
       let res: Response;
       try {
-        res = await resolveFetch(this.fetchImpl)(`${API}${path}`, { method, headers, ...(body !== undefined ? { body } : {}) });
+        // A StreamingForm opens a fresh stream for each attempt.
+        res = await sendBody(resolveFetch(this.fetchImpl), `${API}${path}`, { method, headers }, body);
       } catch (err) {
         throw asNetworkError(err instanceof Error ? new Error(err.message.replaceAll(token, "<token>")) : new Error(String(err).replaceAll(token, "<token>")), `discord ${what}`);
       }

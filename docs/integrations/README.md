@@ -123,8 +123,23 @@ unofficial tools that try get numbers and accounts banned, so Starsign does not 
 
 ## Known limits
 
-- **Big videos on upload-style networks.** Direct uploads keep a 4 GB video out of the API's memory, and networks
-  that pull media by URL (Instagram, Facebook, Threads, Pinterest, TikTok's pull mode) never need the bytes. But
-  connectors that upload bytes themselves (X, YouTube, LinkedIn, Bluesky, Mastodon, Reddit, Telegram, Discord, and
-  TikTok's file mode) still read the whole file into memory when publishing. On a 512 MB instance keep those videos
-  under about 150 MB, or run the workers on a bigger machine, until streamed (chunked) uploads land in those connectors.
+- **Big videos stream; nothing loads a whole video into memory.** Direct uploads keep a 4 GB video out of the API's
+  memory, and publishing does too: the media fetcher serves sizes, byte ranges and streams (positional reads on local
+  disk, ranged GETs and one streamed GET on S3, HEAD + Range for external URLs or one streamed GET when the server has
+  no Range support), and each upload-style connector reads what it sends a piece at a time:
+  - **Chunked protocols, one chunk resident at a time:** X (APPEND segments of `chunkBytes`, 4 MiB), YouTube (resumable
+    PUTs of `chunkSize`, 8 MiB, re-read on resume), LinkedIn (each upload instruction's byte range, about 4 MB).
+  - **One request per chunk, streamed:** TikTok file mode (each chunk, up to 64 MB, is a streamed PUT with
+    `Content-Range`).
+  - **One request with the whole file, streamed with an exact `Content-Length`:** these APIs take the file in a single
+    request body, so it is sent as a stream read in pieces of at most 4 MB (`duplex: "half"`) and memory stays flat:
+    Bluesky (video service), Facebook resumable upload (bytes from `file_offset`), Slack (upload URL), Matrix (media upload),
+    WordPress (`/wp/v2/media`), and as streamed multipart bodies Mastodon, Reddit (S3 form), Pinterest (S3 form),
+    Telegram, Discord (webhook and bot), Misskey, Tumblr and VK. LinkedIn documents are streamed the same way.
+  - **Still read whole:** images, and GIFs outside X (capped at 30 MB), YouTube custom thumbnails and LinkedIn video
+    thumbnails (small images), and Ghost and Lemmy (image uploads only). A source that cannot say how big it is (an
+    external URL with neither `Content-Length` nor Range support) is also read whole, because every upload protocol
+    needs the size first. Networks that pull media by URL (Instagram, Threads, Facebook below its resumable threshold,
+    Pinterest images, TikTok's pull mode) never need the bytes.
+  - API uploads through `POST /v1/media` (local disk, no S3) are still held in memory while they are checked, so keep
+    `STARSIGN_MAX_UPLOAD_MB` well under the instance memory; with S3 the web app uploads straight to the bucket.

@@ -1,7 +1,8 @@
 import type { ActivityInput, Media, MetricInput, MetricName, Network } from "@starsign/schema";
 import { z } from "zod";
-import { asNetworkError, classifyHttpStatus, downloadMedia, isAfter, readJson, resolveFetch, type FetchLike } from "./http.ts";
+import { asNetworkError, classifyHttpStatus, isAfter, readJson, resolveFetch, type FetchLike } from "./http.ts";
 import { IdempotencyCache } from "./idempotency.ts";
+import { mediaSource, sendBody, setMediaFile, uploadForm, withMedia } from "./media-io.ts";
 import { OAuth2Client, clientFromEnv, type OAuth2Token } from "./oauth.ts";
 import type { AccountIdentity, AccountRef, AuthRefresh, ConnectedAccount, Connector, ConnectorCapabilities, PublishInput, PublishResult, ValidationIssue } from "./types.ts";
 import { ConnectorError } from "./types.ts";
@@ -329,16 +330,17 @@ export class PinterestConnector implements Connector {
         creating: true,
       });
       if (!reg.media_id || !reg.upload_url) throw new ConnectorError("pinterest register media: no media_id/upload_url", "unknown", false, reg);
-      const { bytes, mime } = this.media ? await this.media.fetch(m) : await downloadMedia(resolveFetch(this.fetchImpl), m);
-      const form = new FormData();
-      for (const [k, v] of Object.entries(reg.upload_parameters ?? {})) form.set(k, v);
-      form.set("file", new Blob([bytes], { type: mime }), "video.mp4"); // S3 wants the file last
-      let res: Response;
-      try {
-        res = await resolveFetch(this.fetchImpl)(reg.upload_url, { method: "POST", body: form });
-      } catch (err) {
-        throw asNetworkError(err, "pinterest video upload");
-      }
+      // The S3 form POST is streamed (exact Content-Length), so the video is never held whole.
+      const res = await withMedia(mediaSource(this.media, this.fetchImpl), m, async (file) => {
+        const form = uploadForm([file]);
+        for (const [k, v] of Object.entries(reg.upload_parameters ?? {})) form.set(k, v);
+        setMediaFile(form, "file", file, "video.mp4"); // S3 wants the file last
+        try {
+          return await sendBody(resolveFetch(this.fetchImpl), reg.upload_url!, { method: "POST" }, form);
+        } catch (err) {
+          throw asNetworkError(err, "pinterest video upload");
+        }
+      });
       if (!res.ok) {
         const { kind, retryable } = classifyHttpStatus(res.status);
         throw new ConnectorError(`pinterest video upload: HTTP ${res.status}`, kind === "auth" ? "rejected" : kind, retryable, { status: res.status, body: await readJson(res) });

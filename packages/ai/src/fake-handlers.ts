@@ -10,6 +10,8 @@ import type { WriteBriefOutput, WriteBriefVars } from "./prompts/writeBrief.ts";
 import type { TranslateMessagesOutput, TranslateMessagesVars } from "./prompts/translateMessages.ts";
 import type { TranslateKeywordsOutput, TranslateKeywordsVars } from "./prompts/translateKeywords.ts";
 import type { SuggestAliasesOutput, SuggestAliasesVars } from "./prompts/suggestAliases.ts";
+// ---- AI answer visibility
+import { visibilityFakeHandlers } from "./visibility.ts";
 
 /** Trim to the network's text limit by code points (graphemes never exceed code points, so Bluesky stays legal). */
 export function fitToNetwork(text: string, network: Network): string {
@@ -27,6 +29,8 @@ const words = (s: string) => s.toLowerCase().split(/[^a-z0-9]+/).filter((w) => w
  */
 export function defaultFakeHandlers(): Record<string, FakeHandler> {
   return {
+    // ---- AI answer visibility (judgeAnswer, suggestQuestions)
+    ...visibilityFakeHandlers(),
     // Marks text as translated without inventing a translation.
     translateMessages: (vars) => {
       const v = vars as TranslateMessagesVars;

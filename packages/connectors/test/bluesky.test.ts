@@ -454,3 +454,27 @@ describe("bluesky reply, moderate and account metrics", () => {
     expect(connector(agent).capabilities()).toMatchObject({ reply: true, moderate: true, accountMetrics: true, video: true });
   });
 });
+
+describe("bluesky large video", () => {
+  it("streams a 50 MB video to the video service as one body with an exact Content-Length", async () => {
+    const { bigVideo, network, json: j, MiB } = await import("./big-video.ts");
+    const { STREAM_PIECE_BYTES } = await import("../src/index.ts");
+    const { fetcher, stats, media, size } = bigVideo(50 * MiB);
+    const { sent } = network((r) => {
+      if (r.url.pathname === "/xrpc/app.bsky.video.uploadVideo") return j({ jobStatus: { jobId: "jobBig", did: DID, state: "JOB_STATE_CREATED" } });
+      if (r.url.pathname === "/xrpc/app.bsky.video.getJobStatus") return j({ jobStatus: { jobId: "jobBig", did: DID, state: "JOB_STATE_COMPLETED", blob: BLOB_JSON } });
+      return undefined;
+    });
+    const agent = fullAgent();
+    const c = new BlueskyConnector({ agentFactory: () => agent, now: () => NOW, sleep: async () => {} });
+    c.media = fetcher;
+    await c.publish(acct, { ...input, idempotencyKey: "k-big", media: [media] });
+    const up = sent.find((r) => r.url.pathname === "/xrpc/app.bsky.video.uploadVideo")!;
+    expect(up).toMatchObject({ streamed: true, sent: size });
+    expect(up.headers.get("content-type")).toBe("video/mp4");
+    expect(up.headers.get("authorization")).toBe("Bearer svc-token");
+    expect(up.maxPiece).toBeLessThanOrEqual(STREAM_PIECE_BYTES);
+    expect(stats.fetchCalls).toBe(0);
+    expect(stats.maxRead).toBeLessThanOrEqual(STREAM_PIECE_BYTES);
+  });
+});

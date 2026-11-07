@@ -1,6 +1,7 @@
 import { createHash, createHmac } from "node:crypto";
-import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
+import { emptyStream, sliceStream } from "./streams.ts";
 
 /** Where uploaded files live. Keys are unguessable; URLs are public so networks that pull media can fetch them. */
 export interface MediaStorage {
@@ -15,7 +16,12 @@ export interface MediaStorage {
   head?(key: string): Promise<{ bytes: number; mime: string | null; etag: string | null } | null>;
   /** Bytes [start, start + length) of a stored object. */
   getRange?(key: string, start: number, length: number): Promise<Uint8Array>;
+  /** The whole object as a stream, read as it is consumed (connectors upload large videos from this). */
+  stream?(key: string): Promise<{ body: ReadableStream<Uint8Array>; size: number | null }>;
 }
+
+/** Piece size for streaming files off local disk. */
+const LOCAL_PIECE_BYTES = 1024 * 1024;
 
 /** Local disk, served by the API at /media/:key. Fine for one machine and for development. */
 export class LocalStorage implements MediaStorage {
@@ -39,6 +45,67 @@ export class LocalStorage implements MediaStorage {
   async get(key: string): Promise<Uint8Array> {
     return new Uint8Array(await readFile(this.path(key)));
   }
+  async head(key: string): Promise<{ bytes: number; mime: string | null; etag: string | null } | null> {
+    const st = await stat(this.path(key)).catch((err: NodeJS.ErrnoException) => {
+      if (err.code === "ENOENT") return null;
+      throw err;
+    });
+    return st ? { bytes: st.size, mime: null, etag: null } : null;
+  }
+  /** A positional read: only `length` bytes are read from disk. */
+  async getRange(key: string, start: number, length: number): Promise<Uint8Array> {
+    const fh = await open(this.path(key), "r");
+    try {
+      const out = new Uint8Array(Math.max(0, length));
+      let filled = 0;
+      while (filled < out.length) {
+        const { bytesRead } = await fh.read(out, filled, out.length - filled, start + filled);
+        if (bytesRead === 0) break;
+        filled += bytesRead;
+      }
+      return out.subarray(0, filled);
+    } finally {
+      await fh.close();
+    }
+  }
+  /** The file in 1 MB pieces, pulled as the consumer reads; the handle closes at the end or on cancel. */
+  async stream(key: string): Promise<{ body: ReadableStream<Uint8Array>; size: number | null }> {
+    const fh = await open(this.path(key), "r");
+    const size = (await fh.stat()).size;
+    if (size === 0) {
+      await fh.close();
+      return { body: emptyStream(), size: 0 };
+    }
+    let pos = 0;
+    let closed = false;
+    const done = async () => {
+      if (closed) return;
+      closed = true;
+      await fh.close().catch(() => undefined);
+    };
+    const body = new ReadableStream<Uint8Array>(
+      {
+        async pull(c) {
+          try {
+            const buf = new Uint8Array(Math.min(LOCAL_PIECE_BYTES, size - pos));
+            const { bytesRead } = await fh.read(buf, 0, buf.length, pos);
+            pos += bytesRead;
+            if (bytesRead > 0) c.enqueue(bytesRead === buf.length ? buf : buf.subarray(0, bytesRead));
+            if (bytesRead === 0 || pos >= size) {
+              await done();
+              c.close();
+            }
+          } catch (err) {
+            await done();
+            c.error(err);
+          }
+        },
+        cancel: done,
+      },
+      { highWaterMark: 0 },
+    );
+    return { body, size };
+  }
   async delete(key: string): Promise<void> {
     await unlink(this.path(key)).catch(() => {});
   }
@@ -61,7 +128,7 @@ export interface S3Config {
 
 /**
  * Any S3-compatible store (AWS S3, Cloudflare R2, MinIO, Backblaze B2) with path-style requests signed by
- * AWS Signature V4. No SDK: three verbs are all Starsign needs.
+ * AWS Signature V4. No SDK: a handful of verbs are all Starsign needs.
  */
 export class S3Storage implements MediaStorage {
   readonly name = "s3";
@@ -145,9 +212,22 @@ export class S3Storage implements MediaStorage {
     const res = await this.fetchImpl(url, { method: "GET", headers: this.sign("GET", url, new Uint8Array(), { Range: range }) });
     if (res.status === 416) return new Uint8Array();
     if (!res.ok) throw new Error(`s3 range ${key}: HTTP ${res.status}`);
-    const bytes = new Uint8Array(await res.arrayBuffer());
-    // A server that ignores Range sends the whole object; keep only what was asked for.
-    return res.status === 200 ? bytes.subarray(start, start + length) : bytes;
+    // A server that ignores Range sends the whole object: read past `start` and keep only what was asked for,
+    // without holding the rest.
+    if (res.status === 200) return sliceStream(res.body, start, length);
+    return new Uint8Array(await res.arrayBuffer());
+  }
+
+  /** One GET whose body is handed over unread. */
+  async stream(key: string): Promise<{ body: ReadableStream<Uint8Array>; size: number | null }> {
+    const url = this.url(key);
+    const res = await this.fetchImpl(url, { method: "GET", headers: this.sign("GET", url, new Uint8Array()) });
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => undefined);
+      throw new Error(`s3 get ${key}: HTTP ${res.status}`);
+    }
+    const len = res.headers.get("content-length");
+    return { body: res.body ?? emptyStream(), size: len !== null && /^\d+$/.test(len) ? Number(len) : null };
   }
 
   async put(key: string, bytes: Uint8Array, mime: string): Promise<void> {

@@ -4,6 +4,7 @@ import type { ActivityInput, ActivityKind, Media, MetricInput, MetricName, Netwo
 import { z } from "zod";
 import { asNetworkError, classifyHttpStatus, downloadMedia, isAfter, readJson, resolveFetch, type FetchLike } from "./http.ts";
 import { IdempotencyCache } from "./idempotency.ts";
+import { mediaSource, rawBody, sendBody, withMedia, type StreamBody } from "./media-io.ts";
 import type { AccountRef, ConnectedAccount, Connector, ConnectorCapabilities, MediaFetcher, ModerationInput, PublishInput, PublishResult, ValidationIssue } from "./types.ts";
 import { ConnectorError } from "./types.ts";
 
@@ -468,11 +469,14 @@ export class BlueskyConnector implements Connector {
     const pds = new URL(String(agent.pdsUrl ?? s.service));
     const exp = Math.floor(this.now().getTime() / 1000) + 30 * 60;
     const token = (await agent.getServiceAuth({ aud: `did:web:${pds.hostname}`, lxm: "com.atproto.repo.uploadBlob", exp })).data.token;
-    const { bytes } = await this.bytesOf(m);
-    const url = new URL(`${this.videoService}/xrpc/app.bsky.video.uploadVideo`);
-    url.searchParams.set("did", s.did);
-    url.searchParams.set("name", `${this.now().getTime().toString(36)}.mp4`);
-    const body = await this.videoRequest(url, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "video/mp4" }, body: bytes }, "uploadVideo", [409]);
+    // The video service takes the whole file in one request: it is sent as a streamed body with an exact
+    // Content-Length (read piece by piece), so the file is never held in memory.
+    const body = await withMedia(mediaSource(this.media, this.fetchImpl), m, (file) => {
+      const url = new URL(`${this.videoService}/xrpc/app.bsky.video.uploadVideo`);
+      url.searchParams.set("did", s.did);
+      url.searchParams.set("name", `${this.now().getTime().toString(36)}.mp4`);
+      return this.videoRequest(url, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "video/mp4" } }, "uploadVideo", [409], rawBody(file, "video/mp4"));
+    });
     const b = (body ?? {}) as { jobStatus?: AppBskyVideoDefs.JobStatus; jobId?: string };
     const jobId = b.jobStatus?.jobId ?? b.jobId;
     if (!jobId) throw new ConnectorError("bluesky video: uploadVideo returned no job id", "unknown", false, body);
@@ -493,10 +497,10 @@ export class BlueskyConnector implements Connector {
     throw new ConnectorError(`bluesky video: job ${jobId} still processing after ${this.maxProcessingChecks} checks; retry later (the upload is kept)`, "unknown", true);
   }
 
-  private async videoRequest(url: URL, init: RequestInit, what: string, okStatuses: number[] = []): Promise<unknown> {
+  private async videoRequest(url: URL, init: Omit<RequestInit, "headers"> & { headers?: Record<string, string> }, what: string, okStatuses: number[] = [], upload?: Uint8Array | StreamBody): Promise<unknown> {
     let res: Response;
     try {
-      res = await resolveFetch(this.fetchImpl)(url.toString(), init);
+      res = upload === undefined ? await resolveFetch(this.fetchImpl)(url.toString(), init) : await sendBody(resolveFetch(this.fetchImpl), url.toString(), init, upload);
     } catch (err) {
       throw asNetworkError(err, `bluesky video ${what}`);
     }

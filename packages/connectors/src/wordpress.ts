@@ -1,8 +1,9 @@
 import type { ActivityInput, Media, MetricInput, Network, VariantOptions } from "@starsign/schema";
 import { z } from "zod";
 import { firstParagraph, htmlToText, httpFailure, normalizeSiteUrl, siteKey, textToHtml, uploadFileName, escapeHtml, safeUrl } from "./html.ts";
-import { asNetworkError, downloadMedia, isoSeconds, readJson, resolveFetch, type FetchLike } from "./http.ts";
+import { asNetworkError, isoSeconds, readJson, resolveFetch, type FetchLike } from "./http.ts";
 import { IdempotencyCache } from "./idempotency.ts";
+import { mediaSource, rawBody, sendBody, withUpload, type StreamBody } from "./media-io.ts";
 import type { AccountIdentity, AccountRef, ConnectedAccount, Connector, ConnectorCapabilities, MediaFetcher, ModerationInput, PublishInput, PublishResult, ValidationIssue } from "./types.ts";
 import { ConnectorError } from "./types.ts";
 
@@ -233,17 +234,20 @@ export class WordPressConnector implements Connector {
 
   /** POST /wp/v2/media with the raw bytes and a Content-Disposition filename. alt_text rides along as a query parameter. */
   private async uploadMedia(auth: WordPressAuth, m: Media, i: number): Promise<Uploaded> {
-    const { bytes, mime } = this.media ? await this.media.fetch(m) : await downloadMedia(resolveFetch(this.fetchImpl), m);
-    const filename = uploadFileName(m.url, mime, `starsign-${i + 1}`);
-    // TODO(verify): alt_text as a query parameter on the binary upload is applied by WP_REST_Attachments_Controller::create_item.
-    const res = await this.request<{ id: number; source_url?: string }>(
-      auth,
-      "POST",
-      "/wp/v2/media",
-      { query: m.alt ? { alt_text: m.alt } : {}, body: bytes, headers: { "content-type": mime, "content-disposition": `attachment; filename="${filename}"` } },
-      "upload media",
-    );
-    return { id: res.id, url: res.source_url ?? m.url, kind: m.kind === "video" ? "video" : "image", alt: m.alt ?? null };
+    // Videos are sent as a streamed body with an exact Content-Length; images are read whole as before.
+    return withUpload(mediaSource(this.media, this.fetchImpl), m, async (file) => {
+      const mime = file.mime;
+      const filename = uploadFileName(m.url, mime, `starsign-${i + 1}`);
+      // TODO(verify): alt_text as a query parameter on the binary upload is applied by WP_REST_Attachments_Controller::create_item.
+      const res = await this.request<{ id: number; source_url?: string }>(
+        auth,
+        "POST",
+        "/wp/v2/media",
+        { query: m.alt ? { alt_text: m.alt } : {}, body: rawBody(file), headers: { "content-type": mime, "content-disposition": `attachment; filename="${filename}"` } },
+        "upload media",
+      );
+      return { id: res.id, url: res.source_url ?? m.url, kind: m.kind === "video" ? "video" : "image", alt: m.alt ?? null };
+    });
   }
 
   private async uploadThumbnail(auth: WordPressAuth, url: string): Promise<Uploaded> {
@@ -388,17 +392,17 @@ export class WordPressConnector implements Connector {
     return `${auth.siteUrl}/wp-json${path}${qs ? `?${qs}` : ""}`;
   }
 
-  private async request<T>(auth: WordPressAuth, method: string, path: string, opts: { query?: Query; json?: unknown; body?: Uint8Array; headers?: Record<string, string> }, what: string): Promise<T> {
+  private async request<T>(auth: WordPressAuth, method: string, path: string, opts: { query?: Query; json?: unknown; body?: Uint8Array | StreamBody; headers?: Record<string, string> }, what: string): Promise<T> {
     const headers: Record<string, string> = {
       authorization: `Basic ${Buffer.from(`${auth.username}:${auth.applicationPassword}`).toString("base64")}`,
       accept: "application/json",
       ...(opts.json !== undefined ? { "content-type": "application/json" } : {}),
       ...opts.headers,
     };
-    const init: RequestInit = { method, headers, ...(opts.json !== undefined ? { body: JSON.stringify(opts.json) } : opts.body ? { body: opts.body } : {}) };
+    const payload = opts.json !== undefined ? JSON.stringify(opts.json) : opts.body;
     let res: Response;
     try {
-      res = await resolveFetch(this.fetchImpl)(this.url(auth, path, opts.query), init);
+      res = await sendBody(resolveFetch(this.fetchImpl), this.url(auth, path, opts.query), { method, headers }, payload);
     } catch (err) {
       throw asNetworkError(err, `wordpress ${what}`);
     }

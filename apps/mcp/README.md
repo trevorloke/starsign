@@ -109,6 +109,8 @@ Call `get_brand_context` first; it is the only way to get account ids and the br
 | `list_alerts` | read | Operator alerts, unacknowledged only by default. |
 | `get_policy` | read | The full active policy document: autonomy, every red line with parameters, caps, disclosure. |
 | `get_ledger` | read | Query the append-only ledger by event type and subject. |
+| `list_inbox` | read | The team inbox: conversations with status, owner, priority, labels and time left to a first reply (or how late); filter by status, assignee, label, priority, network, text. |
+| `update_inbox_item` | write | Set a conversation's status, add or remove workspace labels, and leave an internal note (`@name` notifies a teammate). Assigning people, priority and rules stay with people. |
 
 Every tool returns `content` with a readable summary first and the raw JSON second. Failures come back as results with `isError: true` and the API's `code` and `message` (and `details` when present); the server never surfaces raw exceptions. Input is validated against zod schemas before any request is made.
 

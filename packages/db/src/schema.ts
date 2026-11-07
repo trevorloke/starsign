@@ -675,3 +675,124 @@ export const schemaMigrations = pgTable("schema_migrations", {
   name: text("name").primaryKey(),
   appliedAt: ts("applied_at").notNull().default(sql`now()`),
 });
+
+// ---- inbox workflow (migration 0011_inbox.sql) --------------------------------------------------
+
+/** Shared work state over the live feed, one row per inbound activity. A conversation's state lives on its root row. */
+export const inboxItems = pgTable(
+  "inbox_items",
+  {
+    activityId: text("activity_id").primaryKey().references(() => activities.id),
+    workspaceId: text("workspace_id").notNull().references(() => workspaces.id),
+    /** The conversation's first activity (itself for a root). */
+    threadId: text("thread_id").notNull(),
+    status: text("status").$type<"open" | "pending" | "done" | "spam">().notNull().default("open"),
+    assignee: text("assignee"),
+    priority: text("priority").$type<"normal" | "high" | "urgent">().notNull().default("normal"),
+    tags: jsonb("tags").$type<string[]>().notNull().default([]),
+    firstResponseAt: ts("first_response_at"),
+    doneAt: ts("done_at"),
+    snoozedUntil: ts("snoozed_until"),
+    slaDueAt: ts("sla_due_at"),
+    lastActivityAt: ts("last_activity_at").notNull(),
+    messageCount: integer("message_count").notNull().default(1),
+    createdAt: now(),
+    updatedAt: ts("updated_at").notNull().defaultNow(),
+  },
+  (t) => [index("inbox_items_thread").on(t.threadId)],
+);
+
+/** Internal notes on a conversation, with @mentions of teammates. */
+export const inboxNotes = pgTable(
+  "inbox_notes",
+  {
+    id: text("id").primaryKey(),
+    workspaceId: text("workspace_id").notNull().references(() => workspaces.id),
+    threadId: text("thread_id").notNull(),
+    author: jsonb("author").$type<ActorJson>().notNull(),
+    text: text("text").notNull(),
+    mentions: jsonb("mentions").$type<string[]>().notNull().default([]),
+    createdAt: now(),
+    editedAt: ts("edited_at"),
+  },
+  (t) => [index("inbox_notes_thread").on(t.threadId, t.createdAt)],
+);
+
+/** Shared answers with variables, inserted into the reply box and edited before they go through the gate. */
+export const savedReplies = pgTable(
+  "saved_replies",
+  {
+    id: text("id").primaryKey(),
+    workspaceId: text("workspace_id").notNull().references(() => workspaces.id),
+    name: text("name").notNull(),
+    text: text("text").notNull(),
+    lang: text("lang"),
+    createdBy: jsonb("created_by").$type<ActorJson>().notNull(),
+    createdAt: now(),
+    updatedAt: ts("updated_at").notNull().defaultNow(),
+  },
+  (t) => [index("saved_replies_ws").on(t.workspaceId, t.name)],
+);
+
+/** Routing rules: conditions → assignee / round robin / tags / priority / spam. Evaluated in position order. */
+export const inboxRules = pgTable(
+  "inbox_rules",
+  {
+    id: text("id").primaryKey(),
+    workspaceId: text("workspace_id").notNull().references(() => workspaces.id),
+    name: text("name").notNull(),
+    position: integer("position").notNull().default(0),
+    enabled: boolean("enabled").notNull().default(true),
+    conditions: jsonb("conditions").$type<Record<string, unknown>>().notNull().default({}),
+    actions: jsonb("actions").$type<Record<string, unknown>>().notNull().default({}),
+    rrCursor: integer("rr_cursor").notNull().default(0),
+    createdBy: jsonb("created_by").$type<ActorJson>().notNull(),
+    createdAt: now(),
+    updatedAt: ts("updated_at").notNull().defaultNow(),
+  },
+  (t) => [index("inbox_rules_ws").on(t.workspaceId, t.position)],
+);
+
+// ---------------------------------------------------------------- analytics & client reports (0010_reports.sql)
+
+/** A saved client report: what to include, how it looks, who gets it and when. Rendered on demand. */
+export const reports = pgTable(
+  "reports",
+  {
+    id: text("id").primaryKey(),
+    workspaceId: text("workspace_id").notNull().references(() => workspaces.id),
+    name: text("name").notNull(),
+    period: text("period").$type<"last_7_days" | "last_30_days" | "calendar_month">().notNull().default("last_7_days"),
+    sections: jsonb("sections").$type<string[]>().notNull().default([]),
+    branding: jsonb("branding").$type<Record<string, unknown>>().notNull().default({}),
+    recipients: jsonb("recipients").$type<string[]>().notNull().default([]),
+    schedule: jsonb("schedule").$type<Record<string, unknown>>().notNull().default({ kind: "none" }),
+    filters: jsonb("filters").$type<Record<string, unknown>>().notNull().default({}),
+    intro: text("intro"),
+    lastSentAt: ts("last_sent_at"),
+    /** The period key last emailed by the schedule: a period is sent once. */
+    lastSentPeriod: text("last_sent_period"),
+    createdBy: jsonb("created_by").$type<ActorJson>().notNull(),
+    createdAt: now(),
+    updatedAt: ts("updated_at").notNull().defaultNow(),
+    deletedAt: ts("deleted_at"),
+  },
+  (t) => [index("reports_ws").on(t.workspaceId, t.deletedAt)],
+);
+
+/** Read-only public links to a report. Only the token's sha256 is stored. */
+export const reportShares = pgTable(
+  "report_shares",
+  {
+    id: text("id").primaryKey(),
+    reportId: text("report_id").notNull().references(() => reports.id),
+    workspaceId: text("workspace_id").notNull().references(() => workspaces.id),
+    tokenHash: text("token_hash").notNull().unique(),
+    purpose: text("purpose").$type<"link" | "email">().notNull().default("link"),
+    createdBy: jsonb("created_by").$type<ActorJson>().notNull(),
+    createdAt: now(),
+    revokedAt: ts("revoked_at"),
+    lastViewedAt: ts("last_viewed_at"),
+  },
+  (t) => [index("report_shares_report").on(t.reportId, t.revokedAt)],
+);

@@ -59,6 +59,12 @@ import type {
   TrendSource,
   Workspace,
 } from "./types";
+// ---- inbox workflow
+import type { InboxConversation, InboxEntry, InboxList, InboxNote, InboxPatch, InboxQuery, InboxRule, InboxRuleInput, InboxSettings, InboxSettingsPatch, SavedReply, SavedReplyInput } from "./types";
+// ---- analytics & client reports
+import type { AnalyticsPayload, AnalyticsQuery, Report, ReportInput, ReportSent, ReportShare } from "./types-analytics";
+// ---- AI answer visibility
+import type { VisAnswer, VisAnswersQuery, VisEngine, VisPrompt, VisPromptInput, VisReport, VisRunResult, VisSettingsPatch, VisSettingsResponse, VisSuggestion } from "./lib/visibility";
 import { ApiError, setKeyMode } from "./lib/errors";
 
 export { ApiError, isApiError, errorText, reasonOf, sentence } from "./lib/errors";
@@ -304,6 +310,25 @@ function pick<T>(live: () => Promise<T>, mock: (f: Fixtures) => Promise<T>): Pro
   return USE_FIXTURES ? fixtures().then(mock) : live();
 }
 
+// ---- analytics & client reports: a rendered report comes back as an HTML document, not JSON.
+async function requestHtml(method: "GET" | "POST", path: string, body?: unknown): Promise<string> {
+  const headers: Record<string, string> = { Accept: "text/html", ...authHeaders(method) };
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  let res: Response;
+  try {
+    res = await fetch(`${BASE}${path}`, { method, headers, credentials: "include", body: body === undefined ? undefined : JSON.stringify(body) });
+  } catch {
+    throw new ApiError(0, "network", "Couldn't reach Starsign.");
+  }
+  const text = await res.text();
+  if (!res.ok) {
+    if (res.status === 401 && !getApiKey()) unauthorizedListener?.();
+    throw toApiError(res.status, res.statusText, text);
+  }
+  return text;
+}
+// ---- end analytics & client reports
+
 export const api = {
   me: () => pick(() => get<Me>("/v1/me"), (f) => f.fixtureApi.me()),
   policy: () => pick(() => get<Policy>("/v1/policy"), (f) => f.fixtureApi.policy()),
@@ -479,14 +504,103 @@ export const api = {
       () => post<AliasSuggestions>(`/v1/entities/${enc(id)}/suggest-aliases`, languages?.length ? { languages } : {}),
       (f) => f.fixtureApi.suggestAliases(id, languages),
     ),
+
+  // ---- inbox workflow: the shared inbox (fixtures in dev/inboxFixtures.ts) ----
+  inbox: (q: InboxQuery = {}) =>
+    pick(
+      () =>
+        get<InboxList>(
+          `/v1/inbox${qs({ status: q.status, assignee: q.assignee, tag: q.tag, priority: q.priority, network: q.network, q: q.q, sort: q.sort, snoozed: q.snoozed ? 1 : undefined, limit: q.limit })}`,
+        ),
+      (f) => f.inboxFixtureApi.list(q),
+    ),
+  conversation: (activityId: string) => pick(() => get<InboxConversation>(`/v1/inbox/${enc(activityId)}`), (f) => f.inboxFixtureApi.conversation(activityId)),
+  /** Viewers get 403; agents may only change status and labels. */
+  patchInbox: (activityId: string, p: InboxPatch) => pick(() => patch<InboxEntry>(`/v1/inbox/${enc(activityId)}`, p), (f) => f.inboxFixtureApi.patch(activityId, p)),
+  bulkInbox: (ids: string[], p: InboxPatch) => pick(() => patch<{ updated: number; items: InboxEntry[] }>("/v1/inbox", { ids, patch: p }), (f) => f.inboxFixtureApi.bulk(ids, p)),
+  addInboxNote: (activityId: string, text: string, mentions?: string[]) =>
+    pick(() => post<InboxNote>(`/v1/inbox/${enc(activityId)}/notes`, { text, ...(mentions?.length ? { mentions } : {}) }), (f) => f.inboxFixtureApi.addNote(activityId, text, mentions)),
+  updateInboxNote: (noteId: string, text: string) => pick(() => patch<InboxNote>(`/v1/inbox/notes/${enc(noteId)}`, { text }), (f) => f.inboxFixtureApi.updateNote(noteId, text)),
+  deleteInboxNote: (noteId: string) => pick(() => del<void>(`/v1/inbox/notes/${enc(noteId)}`), (f) => f.inboxFixtureApi.deleteNote(noteId)),
+  savedReplies: () => pick(() => get<SavedReply[]>("/v1/saved-replies"), (f) => f.inboxFixtureApi.savedReplies()),
+  createSavedReply: (input: SavedReplyInput) => pick(() => post<SavedReply>("/v1/saved-replies", input), (f) => f.inboxFixtureApi.createSavedReply(input)),
+  updateSavedReply: (id: string, input: Partial<SavedReplyInput>) => pick(() => patch<SavedReply>(`/v1/saved-replies/${enc(id)}`, input), (f) => f.inboxFixtureApi.updateSavedReply(id, input)),
+  deleteSavedReply: (id: string) => pick(() => del<void>(`/v1/saved-replies/${enc(id)}`), (f) => f.inboxFixtureApi.deleteSavedReply(id)),
+  /** The saved reply with this conversation's variables filled in. Nothing is sent. */
+  fillSavedReply: (id: string, activityId: string) =>
+    pick(() => post<{ text: string; lang: string | null }>(`/v1/saved-replies/${enc(id)}/fill`, { activityId }), (f) => f.inboxFixtureApi.fillSavedReply(id, activityId)),
+  inboxRules: () => pick(() => get<InboxRule[]>("/v1/inbox/rules"), (f) => f.inboxFixtureApi.rules()),
+  createInboxRule: (input: InboxRuleInput) => pick(() => post<InboxRule>("/v1/inbox/rules", input), (f) => f.inboxFixtureApi.createRule(input)),
+  updateInboxRule: (id: string, input: Partial<InboxRuleInput>) => pick(() => patch<InboxRule>(`/v1/inbox/rules/${enc(id)}`, input), (f) => f.inboxFixtureApi.updateRule(id, input)),
+  deleteInboxRule: (id: string) => pick(() => del<void>(`/v1/inbox/rules/${enc(id)}`), (f) => f.inboxFixtureApi.deleteRule(id)),
+  reorderInboxRules: (ids: string[]) => pick(() => post<InboxRule[]>("/v1/inbox/rules/reorder", { ids }), (f) => f.inboxFixtureApi.reorderRules(ids)),
+  inboxSettings: () => pick(() => get<InboxSettings>("/v1/inbox/settings"), (f) => f.inboxFixtureApi.settings()),
+  /** Owners and approvers. */
+  updateInboxSettings: (input: InboxSettingsPatch) => pick(() => patch<InboxSettings>("/v1/inbox/settings", input), (f) => f.inboxFixtureApi.updateSettings(input)),
+  /** Same as `reply` (POST /v1/feed/:id/reply, through the gate); in fixtures the inbox also hears about it. */
+  replyInInbox: (activityId: string, input: ReplyInput) =>
+    pick(
+      () => post<PostDetail>(`/v1/feed/${enc(activityId)}/reply`, input),
+      (f) =>
+        f.fixtureApi.reply(activityId, input).then((d) => {
+          f.inboxFixtureApi.recordReply(activityId, d);
+          return d;
+        }),
+    ),
+  // ---- end inbox workflow
+  // ---- analytics & client reports (fixtures in dev/fixtures-analytics.ts) ----
+  /** One payload for the Analytics view; anyone in the workspace. */
+  analytics: (q: AnalyticsQuery) =>
+    pick(() => get<AnalyticsPayload>(`/v1/analytics${qs({ from: q.from, to: q.to, networks: q.networks, accounts: q.accounts })}`), (f) => f.analyticsFixtureApi.analytics(q)),
+  reports: () => pick(() => get<Report[]>("/v1/reports"), (f) => f.analyticsFixtureApi.reports()),
+  /** Owners, approvers and editors. */
+  createReport: (input: ReportInput) => pick(() => post<Report>("/v1/reports", input), (f) => f.analyticsFixtureApi.createReport(input)),
+  /** Agents may change anything but the recipients; viewers nothing. */
+  updateReport: (id: string, input: Partial<ReportInput>) => pick(() => patch<Report>(`/v1/reports/${enc(id)}`, input), (f) => f.analyticsFixtureApi.updateReport(id, input)),
+  deleteReport: (id: string) => pick(() => del<void>(`/v1/reports/${enc(id)}`), (f) => f.analyticsFixtureApi.deleteReport(id)),
+  /** The saved report as a self-contained HTML document. */
+  renderReport: (id: string) => pick(() => requestHtml("GET", `/v1/reports/${enc(id)}/render?format=html`), (f) => f.analyticsFixtureApi.renderReport(id)),
+  /** An unsaved definition, rendered for the editor's live preview. */
+  previewReport: (input: ReportInput) => pick(() => requestHtml("POST", "/v1/reports/preview", input), (f) => f.analyticsFixtureApi.previewReport(input)),
+  /** 503 when the server has no mail set up; 400 without recipients. */
+  sendReport: (id: string) => pick(() => post<ReportSent>(`/v1/reports/${enc(id)}/send`), (f) => f.analyticsFixtureApi.sendReport(id)),
+  /** A new read-only link; the URL is only ever shown now. */
+  shareReport: (id: string) => pick(() => post<ReportShare>(`/v1/reports/${enc(id)}/share`), (f) => f.analyticsFixtureApi.shareReport(id)),
+  /** Turns off every link to the report, the emailed ones too. */
+  revokeReportShares: (id: string) => pick(() => del<void>(`/v1/reports/${enc(id)}/share`), (f) => f.analyticsFixtureApi.revokeReportShares(id)),
+  // ---- end analytics & client reports
 };
+
+// ---- AI answer visibility (types in lib/visibility.ts, fixtures in dev/visibility-fixtures.ts)
+export const visibilityApi = {
+  engines: () => pick(() => get<VisEngine[]>("/v1/visibility/engines"), (f) => f.visibilityFixtureApi.engines()),
+  settings: () => pick(() => get<VisSettingsResponse>("/v1/visibility/settings"), (f) => f.visibilityFixtureApi.settings()),
+  /** Engines, cadences and the question limit: owners. Own domains: editors and up. */
+  updateSettings: (p: VisSettingsPatch) => pick(() => patch<VisSettingsResponse>("/v1/visibility/settings", p), (f) => f.visibilityFixtureApi.updateSettings(p)),
+  prompts: (archived = false) => pick(() => get<VisPrompt[]>(`/v1/visibility/prompts${qs({ archived: archived ? 1 : undefined })}`), (f) => f.visibilityFixtureApi.prompts(archived)),
+  createPrompt: (input: VisPromptInput) => pick(() => post<VisPrompt>("/v1/visibility/prompts", input), (f) => f.visibilityFixtureApi.createPrompt(input)),
+  updatePrompt: (id: string, input: Partial<VisPromptInput>) => pick(() => patch<VisPrompt>(`/v1/visibility/prompts/${enc(id)}`, input), (f) => f.visibilityFixtureApi.updatePrompt(id, input)),
+  archivePrompt: (id: string) => pick(() => del<void>(`/v1/visibility/prompts/${enc(id)}`), (f) => f.visibilityFixtureApi.archivePrompt(id)),
+  /** Asks every enabled engine now. 503 without an engine; answers past the spend cap come back as capped. */
+  runPrompt: (id: string) => pick(() => post<VisRunResult>(`/v1/visibility/prompts/${enc(id)}/run`), (f) => f.visibilityFixtureApi.runPrompt(id)),
+  /** Suggestions only; add the chosen ones with createPrompt. 503 without a model or past the spend cap. */
+  suggest: (languages?: string[], count?: number) =>
+    pick(() => post<{ languages: string[]; questions: VisSuggestion[] }>("/v1/visibility/suggest", { ...(languages?.length ? { languages } : {}), ...(count ? { count } : {}) }), (f) => f.visibilityFixtureApi.suggest(languages, count)),
+  report: (from?: string, to?: string) => pick(() => get<VisReport>(`/v1/visibility/report${qs({ from, to })}`), (f) => f.visibilityFixtureApi.report(from, to)),
+  answers: (q: VisAnswersQuery = {}) =>
+    pick(
+      () => get<VisAnswer[]>(`/v1/visibility/answers${qs({ promptId: q.promptId, engine: q.engine, entity: q.entity, mentioned: q.mentioned === false ? 0 : undefined, lang: q.lang, limit: q.limit })}`),
+      (f) => f.visibilityFixtureApi.answers(q),
+    ),
+};
+// ---- end AI answer visibility
 
 export interface StreamHandlers {
   onEvent: (e: FeedEvent) => void;
   onStatus: (s: LiveStatus) => void;
 }
 
-const SSE_EVENTS = ["activity", "post", "alert", "forecast"] as const;
+const SSE_EVENTS = ["activity", "post", "alert", "forecast", "inbox"] as const; // "inbox": inbox workflow
 
 /**
  * Opens the live stream (GET /v1/feed/stream, SSE). EventSource cannot send headers, so a single-use

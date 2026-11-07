@@ -539,7 +539,9 @@ export type FeedEvent =
     }
   | { type: "post"; data: { workspaceId: string; postId: string; status: PostStatus } }
   | { type: "alert"; data: { workspaceId: string; id: string; title: string; severity: AlertSeverity } }
-  | { type: "forecast"; data: { topicId: string; stage: TrendStage; confidence: number } };
+  | { type: "forecast"; data: { topicId: string; stage: TrendStage; confidence: number } }
+  // ---- inbox workflow
+  | { type: "inbox"; data: InboxLiveEvent };
 
 export type LiveStatus = "live" | "connecting" | "off";
 
@@ -1047,3 +1049,222 @@ export interface AliasSuggestions {
   /** Names that also mean something else: worth context words. */
   ambiguous: string[];
 }
+
+// ---- inbox workflow ---------------------------------------------------------------------------
+
+export type InboxStatus = "open" | "pending" | "done" | "spam";
+export type InboxPriority = "normal" | "high" | "urgent";
+export type InboxSort = "newest" | "oldest" | "due" | "priority";
+/** none: no target applies; met / missed: answered; ok / soon / overdue: waiting on the team. */
+export type SlaState = "none" | "met" | "missed" | "ok" | "soon" | "overdue";
+
+export interface InboxSla {
+  dueAt: string | null;
+  state: SlaState;
+  /** Until due; negative when overdue. Null unless waiting. */
+  msLeft: number | null;
+  targetMinutes: number;
+}
+
+export interface InboxItemState {
+  status: InboxStatus;
+  /** A member's user id. */
+  assignee: string | null;
+  priority: InboxPriority;
+  tags: string[];
+  firstResponseAt: string | null;
+  doneAt: string | null;
+  snoozedUntil: string | null;
+  slaDueAt: string | null;
+  lastActivityAt: string;
+  messageCount: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** One conversation in the queue: its first message (whose id is the item's id) and the newest one. */
+export interface InboxEntry {
+  activity: Activity;
+  latest: Activity | null;
+  state: InboxItemState;
+  sla: InboxSla;
+  notes: number;
+}
+
+export interface InboxCounts {
+  open: number;
+  pending: number;
+  done: number;
+  spam: number;
+  /** Open or pending, assigned to the person asking. */
+  mine: number;
+  /** Open with nobody on it. */
+  unassigned: number;
+  snoozed: number;
+}
+
+export interface InboxViewer {
+  userId: string | null;
+  canWork: boolean;
+  canAssign: boolean;
+  canManage: boolean;
+}
+
+/** GET /v1/inbox */
+export interface InboxList {
+  items: InboxEntry[];
+  counts: InboxCounts;
+  viewer: InboxViewer;
+}
+
+export interface InboxQuery {
+  status?: InboxStatus[];
+  /** "me", "none", or a user id. */
+  assignee?: string;
+  tag?: string;
+  priority?: InboxPriority[];
+  network?: Network[];
+  q?: string;
+  sort?: InboxSort;
+  snoozed?: boolean;
+  limit?: number;
+}
+
+export interface InboxPatch {
+  status?: InboxStatus;
+  /** A user id, "me", or null to unassign. */
+  assignee?: string | null;
+  priority?: InboxPriority;
+  tags?: string[];
+  addTags?: string[];
+  removeTags?: string[];
+  snoozedUntil?: string | null;
+}
+
+export interface InboxNote {
+  id: string;
+  workspaceId: string;
+  threadId: string;
+  author: Actor;
+  text: string;
+  /** User ids. */
+  mentions: string[];
+  createdAt: string;
+  editedAt: string | null;
+}
+
+/** A reply the team sent (or is sending) in this conversation. */
+export interface InboxReply {
+  postId: string;
+  status: PostStatus;
+  text: string;
+  replyTo: string | null;
+  network: string;
+  createdAt: string;
+  createdBy: Actor;
+  publishedAt: string | null;
+}
+
+/** GET /v1/inbox/:activityId */
+export interface InboxConversation {
+  item: InboxEntry;
+  messages: Activity[];
+  /** The post the conversation answers, when it is in the feed (usually the brand's own). */
+  parent: Activity | null;
+  replies: InboxReply[];
+  notes: InboxNote[];
+}
+
+export interface SavedReply {
+  id: string;
+  workspaceId: string;
+  name: string;
+  text: string;
+  lang: string | null;
+  createdBy: Actor;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SavedReplyInput {
+  name: string;
+  text: string;
+  lang?: string | null;
+}
+
+export type InboxTagColor = "gray" | "blue" | "green" | "amber" | "red" | "violet";
+export interface InboxTag {
+  name: string;
+  color: InboxTagColor;
+}
+
+export interface InboxBusinessHours {
+  enabled: boolean;
+  /** 0 = Sunday … 6 = Saturday. */
+  days: number[];
+  start: string;
+  end: string;
+}
+
+/** GET /v1/inbox/settings */
+export interface InboxSettings {
+  /** First-response targets in minutes. */
+  sla: Record<InboxPriority, number>;
+  businessHours: InboxBusinessHours;
+  tags: InboxTag[];
+  timezone: string;
+}
+
+export interface InboxSettingsPatch {
+  sla?: Partial<Record<InboxPriority, number>>;
+  businessHours?: Partial<InboxBusinessHours>;
+  tags?: InboxTag[];
+}
+
+export interface InboxRuleConditions {
+  streams: string[];
+  entities: string[];
+  networks: string[];
+  kinds: string[];
+  languages: string[];
+  keywords: string[];
+}
+
+export interface InboxRuleActions {
+  assignee?: string | null;
+  roundRobin?: string[];
+  tags?: string[];
+  priority?: InboxPriority;
+  spam?: boolean;
+}
+
+export interface InboxRule {
+  id: string;
+  workspaceId: string;
+  name: string;
+  position: number;
+  enabled: boolean;
+  conditions: InboxRuleConditions;
+  actions: InboxRuleActions;
+  rrCursor: number;
+  createdBy: Actor;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface InboxRuleInput {
+  name: string;
+  enabled?: boolean;
+  conditions?: Partial<InboxRuleConditions>;
+  actions: InboxRuleActions;
+}
+
+/** SSE "inbox": something changed in the shared inbox. `userIds` on "assigned" and "mention" say who to tell. */
+export interface InboxLiveEvent {
+  workspaceId: string;
+  kind: "new" | "updated" | "assigned" | "mention" | "note" | "settings";
+  ids?: string[];
+  userIds?: string[];
+  noteId?: string;
+}
+// ---- end inbox workflow

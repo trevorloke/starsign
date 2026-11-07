@@ -1,8 +1,9 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import type { ActivityInput, ActivityKind, Media, MetricInput, Network } from "@starsign/schema";
 import { z } from "zod";
-import { asNetworkError, downloadMedia, readJson, resolveFetch, type FetchLike } from "./http.ts";
+import { asNetworkError, readJson, resolveFetch, type FetchLike } from "./http.ts";
 import { IdempotencyCache } from "./idempotency.ts";
+import { mediaSource, rawBody, sendBody, withUpload } from "./media-io.ts";
 import type { AccountIdentity, AccountRef, ConnectedAccount, Connector, ConnectorCapabilities, MediaFetcher, ModerationInput, PublishInput, PublishResult, ValidationIssue, WebhookBatch, WebhookHandler } from "./types.ts";
 import { ConnectorError } from "./types.ts";
 
@@ -534,18 +535,21 @@ export class SlackConnector implements Connector {
   private async publishFiles(token: string, cfg: SlackAccountConfig, channel: string, text: string, media: Media[], threadTs?: string): Promise<PublishResult> {
     const uploaded: { id: string; title: string }[] = [];
     for (const [i, m] of media.slice(0, LIMITS.files).entries()) {
-      const { bytes, mime } = await this.bytesOf(m);
-      const filename = fileName(m, mime, i);
-      const u = await this.api<{ upload_url: string; file_id: string }>(token, "files.getUploadURLExternal", { filename, length: String(bytes.byteLength), ...(m.alt ? { alt_txt: m.alt.slice(0, 1000) } : {}) }, "get upload URL");
-      // TODO(verify): the upload URL takes the raw bytes (or multipart) in a POST and needs no Authorization header.
-      let res: Response;
-      try {
-        res = await resolveFetch(this.fetchImpl)(u.upload_url, { method: "POST", headers: { "content-type": mime }, body: bytes });
-      } catch (err) {
-        throw asNetworkError(err, "slack upload file");
-      }
-      if (!res.ok) throw mapSlackError(res.status, res.headers, await readJson(res), "upload file");
-      uploaded.push({ id: u.file_id, title: m.alt?.slice(0, 250) || filename });
+      // Videos and documents are sent as a streamed body with an exact Content-Length; images are read whole.
+      await withUpload(mediaSource(this.media, this.fetchImpl), m, async (file) => {
+        const mime = file.mime;
+        const filename = fileName(m, mime, i);
+        const u = await this.api<{ upload_url: string; file_id: string }>(token, "files.getUploadURLExternal", { filename, length: String(file.size), ...(m.alt ? { alt_txt: m.alt.slice(0, 1000) } : {}) }, "get upload URL");
+        // TODO(verify): the upload URL takes the raw bytes (or multipart) in a POST and needs no Authorization header.
+        let res: Response;
+        try {
+          res = await sendBody(resolveFetch(this.fetchImpl), u.upload_url, { method: "POST", headers: { "content-type": mime } }, rawBody(file));
+        } catch (err) {
+          throw asNetworkError(err, "slack upload file");
+        }
+        if (!res.ok) throw mapSlackError(res.status, res.headers, await readJson(res), "upload file");
+        uploaded.push({ id: u.file_id, title: m.alt?.slice(0, 250) || filename });
+      });
     }
     const done = await this.api<{ files?: SlackFile[] }>(
       token,
@@ -565,10 +569,6 @@ export class SlackConnector implements Connector {
     const externalId = `${channel}:${ts}`;
     this.ownMessages.set(externalId, true);
     return { externalId, url: slackPermalink(cfg.teamUrl, channel, ts, threadTs), raw: { files: done.files, fileIds } };
-  }
-
-  private bytesOf(m: Media): Promise<{ bytes: Uint8Array; mime: string }> {
-    return this.media ? this.media.fetch(m) : downloadMedia(resolveFetch(this.fetchImpl), m);
   }
 
   // ---- engage ---------------------------------------------------------------------------

@@ -3,6 +3,7 @@ import { z } from "zod";
 import { GoogleAuth, googleClientFromEnv, googleOAuthClient, googleRequest, googleStatusOf, googleTokenToAuth, mapGoogleError, refreshGoogleAuth, type GoogleRequestOptions } from "./google-oauth.ts";
 import { asNetworkError, downloadMedia, isAfter, readJson, resolveFetch, type FetchLike } from "./http.ts";
 import { IdempotencyCache } from "./idempotency.ts";
+import { mediaSource, withMedia, type MediaReader } from "./media-io.ts";
 import type { OAuth2Client } from "./oauth.ts";
 import type { AccountIdentity, AccountRef, AuthRefresh, ConnectedAccount, Connector, ConnectorCapabilities, MediaFetcher, ModerationInput, PublishInput, PublishResult, ValidationIssue } from "./types.ts";
 import { ConnectorError } from "./types.ts";
@@ -145,6 +146,29 @@ function resetIn(d: Date): string {
 const QUOTA_HINT = "YouTube quota resets at midnight Pacific; the default is 10,000 units/day per Google Cloud project plus a separate daily video-upload bucket";
 
 // ---- MP4 probe ------------------------------------------------------------------------------
+
+/**
+ * probeMp4 without reading the whole file: walk the top-level boxes with 16-byte header reads and probe only the moov
+ * box (phones write it after the media data). Gives up (returns {}) when moov is missing or unreasonably large.
+ */
+export async function probeMp4Ranged(file: MediaReader, maxMoovBytes = 16 * 1024 * 1024): Promise<{ durationSeconds?: number; width?: number; height?: number }> {
+  if (file.bytes) return probeMp4(file.bytes);
+  let p = 0;
+  for (let n = 0; n < 256 && p + 8 <= file.size; n++) {
+    const h = await file.read(p, Math.min(16, file.size - p));
+    const dv = new DataView(h.buffer, h.byteOffset, h.byteLength);
+    let size = dv.getUint32(0);
+    const type = String.fromCharCode(h[4]!, h[5]!, h[6]!, h[7]!);
+    if (size === 1) {
+      if (h.byteLength < 16) return {};
+      size = Number(dv.getBigUint64(8));
+    } else if (size === 0) size = file.size - p;
+    if (size < 8 || p + size > file.size) return {};
+    if (type === "moov") return size <= maxMoovBytes ? probeMp4(await file.read(p, size)) : {};
+    p += size;
+  }
+  return {};
+}
 
 /** Duration and display dimensions from an MP4/MOV header (moov/mvhd + first video tkhd, rotation applied). */
 export function probeMp4(bytes: Uint8Array): { durationSeconds?: number; width?: number; height?: number } {
@@ -424,23 +448,26 @@ export class YouTubeConnector implements Connector {
     let video = this.uploaded.get(key);
     if (!video) {
       const media = input.media[0]!;
-      const { bytes, mime } = await this.readMedia(media);
-      if (kind === "short") {
-        const probed = probeMp4(bytes);
-        const problems = shortIssues({ ...media, durationSeconds: media.durationSeconds ?? probed.durationSeconds, width: media.width ?? probed.width, height: media.height ?? probed.height });
-        if (problems.length) throw new ConnectorError(`youtube short: ${problems.map((i) => i.message).join("; ")}`, "rejected", false);
-      }
-      const resource: Record<string, unknown> = {
-        snippet: { title: o.title!.trim(), description: input.text, ...(o.tags?.length ? { tags: o.tags } : {}), categoryId: cfg.categoryId ?? "22" },
-        status: { privacyStatus: privacy, selfDeclaredMadeForKids: cfg.madeForKids ?? false, embeddable: true },
-      };
-      const parts = ["snippet", "status"];
-      if (o.brandedContent) {
-        // TODO(verify): paidProductPlacementDetails.hasPaidProductPlacement is settable on insert with this part.
-        resource.paidProductPlacementDetails = { hasPaidProductPlacement: true };
-        parts.push("paidProductPlacementDetails");
-      }
-      video = await this.resumableUpload(account, auth, key, bytes, mime, resource, parts, cfg.notifySubscribers ?? true);
+      // Opened for ranged reads: the resumable upload reads one chunk at a time, so the video is never held whole.
+      video = await withMedia(mediaSource(this.media, this.fetchImpl), media, async (file) => {
+        const mime = file.mime || media.mime || "video/mp4";
+        if (kind === "short") {
+          const probed = await probeMp4Ranged(file);
+          const problems = shortIssues({ ...media, durationSeconds: media.durationSeconds ?? probed.durationSeconds, width: media.width ?? probed.width, height: media.height ?? probed.height });
+          if (problems.length) throw new ConnectorError(`youtube short: ${problems.map((i) => i.message).join("; ")}`, "rejected", false);
+        }
+        const resource: Record<string, unknown> = {
+          snippet: { title: o.title!.trim(), description: input.text, ...(o.tags?.length ? { tags: o.tags } : {}), categoryId: cfg.categoryId ?? "22" },
+          status: { privacyStatus: privacy, selfDeclaredMadeForKids: cfg.madeForKids ?? false, embeddable: true },
+        };
+        const parts = ["snippet", "status"];
+        if (o.brandedContent) {
+          // TODO(verify): paidProductPlacementDetails.hasPaidProductPlacement is settable on insert with this part.
+          resource.paidProductPlacementDetails = { hasPaidProductPlacement: true };
+          parts.push("paidProductPlacementDetails");
+        }
+        return this.resumableUpload(account, auth, key, file, mime, resource, parts, cfg.notifySubscribers ?? true);
+      });
       this.uploaded.set(key, video);
     }
     const videoId = video.id;
@@ -476,8 +503,8 @@ export class YouTubeConnector implements Connector {
    * in chunks with Content-Range, follow 308 Resume Incomplete + Range, and after a 5xx or a dropped connection ask
    * the session where it stands (`Content-Range: bytes * /total`) and continue from there.
    */
-  private async resumableUpload(account: AccountRef, auth: YouTubeAuth, key: string, bytes: Uint8Array, mime: string, resource: Record<string, unknown>, parts: string[], notify: boolean): Promise<YtVideo> {
-    const total = bytes.length;
+  private async resumableUpload(account: AccountRef, auth: YouTubeAuth, key: string, file: MediaReader, mime: string, resource: Record<string, unknown>, parts: string[], notify: boolean): Promise<YtVideo> {
+    const total = file.size;
     let session = this.sessions.get(key);
     let offset = 0;
     if (session && session.total === total) {
@@ -519,11 +546,13 @@ export class YouTubeConnector implements Connector {
     while (true) {
       const end = Math.min(offset + this.chunkSize, total) - 1;
       let res: Response | null = null;
+      // One chunk (a multiple of 256 KiB, except the last) is read for each PUT and dropped after it.
+      const chunk = await file.read(offset, end + 1 - offset);
       try {
         res = await resolveFetch(this.fetchImpl)(session.uploadUrl, {
           method: "PUT",
           headers: { authorization: `Bearer ${auth.accessToken}`, "content-type": mime, "content-range": `bytes ${offset}-${end}/${total}` },
-          body: bytes.subarray(offset, end + 1) as unknown as RequestInit["body"],
+          body: chunk as unknown as RequestInit["body"],
         });
       } catch {
         res = null; // dropped connection: treat like a 5xx and ask the session where it stands

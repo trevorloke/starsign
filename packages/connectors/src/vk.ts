@@ -2,6 +2,7 @@ import type { ActivityInput, ActivityKind, Media, MetricInput, MetricName, Netwo
 import { z } from "zod";
 import { asNetworkError, classifyHttpStatus, downloadMedia, isAfter, readJson, resolveFetch, type FetchLike } from "./http.ts";
 import { IdempotencyCache } from "./idempotency.ts";
+import { mediaSource, sendBody, setMediaFile, uploadForm, withMedia, type StreamingForm } from "./media-io.ts";
 import { OAuth2Client, clientFromEnv, type OAuth2Token } from "./oauth.ts";
 import type { AccountIdentity, AccountRef, AuthRefresh, ConnectedAccount, Connector, ConnectorCapabilities, ModerationInput, PublishInput, PublishResult, ValidationIssue } from "./types.ts";
 import { ConnectorError } from "./types.ts";
@@ -369,10 +370,12 @@ export class VkConnector implements Connector {
       "video.save",
     );
     if (!save.upload_url) throw new ConnectorError("vk video.save: no upload_url", "unknown", false, save);
-    const { bytes, mime } = await this.read(m);
-    const form = new FormData();
-    form.set("video_file", new Blob([bytes], { type: mime }), "video.mp4");
-    const up = await this.upload<{ video_id?: number; owner_id?: number }>(save.upload_url, form, "video upload");
+    // The video goes up as a streamed multipart body with an exact Content-Length, never held whole.
+    const up = await withMedia(mediaSource(this.media, this.fetchImpl), m, async (file) => {
+      const form = uploadForm([file]);
+      setMediaFile(form, "video_file", file, "video.mp4");
+      return this.upload<{ video_id?: number; owner_id?: number }>(save.upload_url!, form, "video upload");
+    });
     const id = up.video_id ?? save.video_id;
     const vOwner = up.owner_id ?? save.owner_id ?? owner;
     if (!id) throw new ConnectorError("vk video upload: no video_id", "unknown", false, up);
@@ -523,10 +526,10 @@ export class VkConnector implements Connector {
   }
 
   /** POST a file to a VK upload server; those answer with JSON (and their own `error` strings). */
-  private async upload<T>(url: string, form: FormData, what: string): Promise<T> {
+  private async upload<T>(url: string, form: FormData | StreamingForm, what: string): Promise<T> {
     let res: Response;
     try {
-      res = await resolveFetch(this.fetchImpl)(url, { method: "POST", body: form });
+      res = await sendBody(resolveFetch(this.fetchImpl), url, { method: "POST" }, form);
     } catch (err) {
       throw asNetworkError(err, `vk ${what}`);
     }

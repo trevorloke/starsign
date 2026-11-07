@@ -29,8 +29,18 @@ export interface PublishInput {
 
 /** Reads media bytes for upload-style APIs (X, Bluesky, LinkedIn, YouTube, TikTok FILE_UPLOAD, Reddit). */
 export interface MediaFetcher {
-  /** Bytes and type of a media item, from Starsign storage when it has an assetId, else by URL. */
+  /**
+   * Bytes and type of a media item, from Starsign storage when it has an assetId, else by URL. The whole file is in
+   * memory: use it for images and small files only. Video paths read through `openMedia` / `readChunks` (media-io.ts),
+   * which use the methods below when present and fall back to this one.
+   */
   fetch(media: Media): Promise<{ bytes: Uint8Array; mime: string }>;
+  /** Size in bytes, or null when it cannot be known without downloading (the reader then streams instead). */
+  size?(media: Media): Promise<number | null>;
+  /** Bytes [start, start + length); exactly `length` bytes unless the file is shorter. */
+  range?(media: Media, start: number, length: number): Promise<Uint8Array>;
+  /** The whole file as a web stream, read as it is consumed. `size` is null when the source does not say. */
+  stream?(media: Media): Promise<{ body: ReadableStream<Uint8Array>; size: number | null; mime: string }>;
 }
 
 export interface PublishResult {

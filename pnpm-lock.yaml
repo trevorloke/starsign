@@ -141,6 +141,9 @@ importers:
 
   apps/workers:
     dependencies:
+      '@starsign/ai':
+        specifier: workspace:*
+        version: link:../../packages/ai
       '@starsign/connectors':
         specifier: workspace:*
         version: link:../../packages/connectors

@@ -45,6 +45,15 @@ export class ExportService {
       alerts: await db.select().from(t.alerts).where(eq(t.alerts.workspaceId, ws)),
       briefs: await db.select().from(t.briefs).where(eq(t.briefs.workspaceId, ws)),
       operatorRuns: await db.select().from(t.operatorRuns).where(eq(t.operatorRuns.workspaceId, ws)),
+      // ---- analytics & client reports (share links without their token hashes)
+      reports: await db.select().from(t.reports).where(eq(t.reports.workspaceId, ws)),
+      reportShares: (await db.select().from(t.reportShares).where(eq(t.reportShares.workspaceId, ws))).map(({ tokenHash, ...rest }) => rest),
+      // ---- AI answer visibility
+      visibilitySettings: await db.select().from(t.visibilitySettings).where(eq(t.visibilitySettings.workspaceId, ws)),
+      visibilityPrompts: await db.select().from(t.visibilityPrompts).where(eq(t.visibilityPrompts.workspaceId, ws)),
+      visibilityAnswers: await db.select().from(t.visibilityAnswers).where(eq(t.visibilityAnswers.workspaceId, ws)),
+      visibilityMentions: await db.select().from(t.visibilityMentions).where(eq(t.visibilityMentions.workspaceId, ws)),
+      // ---- end AI answer visibility
       ledgerEvents: await db.select().from(t.ledgerEvents).where(eq(t.ledgerEvents.workspaceId, ws)).orderBy(t.ledgerEvents.seq),
       rawEvents: await db.select().from(t.rawEvents).where(eq(t.rawEvents.workspaceId, ws)).orderBy(t.rawEvents.seq),
     };

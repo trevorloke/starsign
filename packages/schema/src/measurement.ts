@@ -30,7 +30,7 @@ export const MetricName = z.enum([
 ]);
 export type MetricName = z.infer<typeof MetricName>;
 
-export const MetricEntityType = z.enum(["post_variant", "social_account", "workspace", "trend_topic", "competitor"]);
+export const MetricEntityType = z.enum(["post_variant", "social_account", "workspace", "trend_topic", "competitor", /* AI answer visibility: per tracked name */ "tracked_entity"]);
 export type MetricEntityType = z.infer<typeof MetricEntityType>;
 
 export const MetricInput = z.object({

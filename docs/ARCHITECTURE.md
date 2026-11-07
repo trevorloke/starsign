@@ -117,6 +117,18 @@ Outcome snapshots merge these first-party numbers (`tracked_clicks`, `conversion
 each offset's due time) over the network's, which makes outcomes comparable across networks that report nothing alike,
 and lets experiments use `conversions` as their primary metric.
 
+## Analytics and client reports
+
+`AnalyticsService` (`packages/core/src/services/analytics.ts`) answers one payload for a window and the equal window
+before it, from what is already recorded: outcome snapshots (72h, else 24h, else latest metrics), owned clicks and
+conversions, follower series and received mentions. Best times and "what worked" look back at least 90 days, bucket
+by the workspace's local weekday and hour, and never claim anything from thin data (fewer than 3 posts a cell, 5 a
+side). The payload types, that math and the report renderer live in one import-free module
+(`analytics-shared.ts`) that the web app imports too, so its fixtures render a sample report with the real renderer.
+`ReportService` turns a saved definition into a self-contained HTML document (no scripts, no external loads but the
+logo), emails it (once per period on a schedule, claimed in `last_sent_period`) and serves read-only share links whose
+tokens are stored only as sha256.
+
 ## Adding a connector
 
 Implement `Connector` from `@starsign/connectors` (publish / fetchActivity / fetchMetrics / capabilities), map errors to

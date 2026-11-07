@@ -1,7 +1,8 @@
 import type { ActivityInput, Media, MetricInput, Network } from "@starsign/schema";
 import { z } from "zod";
-import { asNetworkError, downloadMedia, readJson, resolveFetch, type FetchLike } from "./http.ts";
+import { asNetworkError, readJson, resolveFetch, type FetchLike } from "./http.ts";
 import { IdempotencyCache } from "./idempotency.ts";
+import { mediaSource, openForUpload, sendBody, setMediaFile, uploadForm, type MediaReader, type StreamingForm } from "./media-io.ts";
 import type { AccountIdentity, AccountRef, ConnectedAccount, Connector, ConnectorCapabilities, MediaFetcher, ModerationInput, PublishInput, PublishResult, ValidationIssue } from "./types.ts";
 import { ConnectorError } from "./types.ts";
 
@@ -155,31 +156,35 @@ export class DiscordConnector implements Connector {
         };
         if (!opts.title) payload.content = "";
       }
-      let body: string | FormData;
+      let body: string | FormData | StreamingForm;
       const headers: Record<string, string> = {};
-      if (input.media.length > 0) {
-        const form = new FormData();
-        const files = await Promise.all(input.media.slice(0, LIMITS.files).map((m) => this.bytesOf(m)));
-        payload.attachments = input.media.slice(0, LIMITS.files).map((m, i) => ({ id: i, filename: fileName(m, files[i]!.mime, i), ...(m.alt ? { description: m.alt.slice(0, 1024) } : {}) }));
-        form.set("payload_json", JSON.stringify(payload));
-        input.media.slice(0, LIMITS.files).forEach((m, i) => form.set(`files[${i}]`, new Blob([files[i]!.bytes], { type: files[i]!.mime }), fileName(m, files[i]!.mime, i)));
-        body = form;
-      } else {
-        headers["content-type"] = "application/json";
-        body = JSON.stringify(payload);
+      // Videos and documents are opened for streaming; when any is, the multipart body is streamed with an exact
+      // Content-Length instead of being assembled in memory.
+      const files: MediaReader[] = [];
+      let msg: DiscordMessage;
+      try {
+        if (input.media.length > 0) {
+          for (const m of input.media.slice(0, LIMITS.files)) files.push(await openForUpload(mediaSource(this.media, this.fetchImpl), m));
+          const form = uploadForm(files);
+          payload.attachments = input.media.slice(0, LIMITS.files).map((m, i) => ({ id: i, filename: fileName(m, files[i]!.mime, i), ...(m.alt ? { description: m.alt.slice(0, 1024) } : {}) }));
+          form.set("payload_json", JSON.stringify(payload));
+          input.media.slice(0, LIMITS.files).forEach((m, i) => setMediaFile(form, `files[${i}]`, files[i]!, fileName(m, files[i]!.mime, i)));
+          body = form;
+        } else {
+          headers["content-type"] = "application/json";
+          body = JSON.stringify(payload);
+        }
+        const url = new URL(hook.base);
+        url.searchParams.set("wait", "true");
+        if (hook.threadId) url.searchParams.set("thread_id", hook.threadId);
+        msg = (await this.request(url.toString(), { method: "POST", headers }, "execute webhook", body)) as DiscordMessage;
+      } finally {
+        for (const f of files) await f.close();
       }
-      const url = new URL(hook.base);
-      url.searchParams.set("wait", "true");
-      if (hook.threadId) url.searchParams.set("thread_id", hook.threadId);
-      const msg = (await this.request(url.toString(), { method: "POST", headers, body }, "execute webhook")) as DiscordMessage;
       if (!msg?.id) throw new ConnectorError("discord publish: response carried no message id", "unknown", false, msg);
       const guild = typeof account.config.guildId === "string" ? account.config.guildId : null;
       return { externalId: msg.id, url: guild ? `https://discord.com/channels/${guild}/${msg.channel_id}/${msg.id}` : null, raw: msg };
     });
-  }
-
-  private bytesOf(m: Media): Promise<{ bytes: Uint8Array; mime: string }> {
-    return this.media ? this.media.fetch(m) : downloadMedia(resolveFetch(this.fetchImpl), m);
   }
 
   /** Only delete is possible: a webhook can remove the messages it posted. */
@@ -200,10 +205,10 @@ export class DiscordConnector implements Connector {
     return [];
   }
 
-  private async request(url: string, init: RequestInit, what: string): Promise<unknown> {
+  private async request(url: string, init: Omit<RequestInit, "body" | "headers"> & { headers?: Record<string, string> }, what: string, payload?: unknown): Promise<unknown> {
     let res: Response;
     try {
-      res = await resolveFetch(this.fetchImpl)(url, init);
+      res = await sendBody(resolveFetch(this.fetchImpl), url, init, payload);
     } catch (err) {
       const scrub = (s: string) => s.replace(/webhooks\/\d+\/[A-Za-z0-9_-]+/g, "webhooks/<id>/<token>");
       throw asNetworkError(err instanceof Error ? new Error(scrub(err.message)) : err, `discord ${what}`);

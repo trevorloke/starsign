@@ -13,6 +13,9 @@ import { adaptForNetwork, gatewayKeywordExpander, gatewayTranslator, runPrompt, 
 import { createMentionSearches, type MentionSearch, type SourceAdapter } from "@starsign/sources";
 import { Network as NetworkEnum, NETWORK_LIMITS } from "@starsign/schema";
 import { allowedWithoutWorkspace, clearSessionCookie, csrfOk, CSRF_HEADER, isPublicAuthRoute, isWrite, registerAuthRoutes, SESSION_COOKIE, setSessionCookie } from "./auth-routes.ts";
+import { registerInboxRoutes } from "./routes-inbox.ts"; // ---- inbox workflow
+import { registerVisibilityRoutes } from "./routes-visibility.ts"; // ---- AI answer visibility
+import { registerAnalyticsRoutes } from "./routes-analytics.ts"; // ---- analytics & client reports
 
 export const VERSION = "0.1.0";
 
@@ -30,6 +33,9 @@ export interface AppOptions {
   publicUrl?: string;
   /** Public mention search for the tracker's "scan now". Default: every configured search. */
   mentionSearches?: MentionSearch[];
+  // ---- AI answer visibility
+  /** Answer engines to ask (tests). Default: one per key in the environment. */
+  answerEngines?: import("@starsign/core").VisibilityEngine[];
 }
 
 const err = (code: string, message: string, details?: unknown) => ({ error: { code, message, details } });
@@ -207,6 +213,9 @@ export function createApp(m: Starsign, opts: AppOptions = {}) {
 
   // ---------------------------------------------------------------- people: sign-in, sessions, teams
   registerAuthRoutes(app, m, { publicUrl: opts.publicUrl });
+  registerInboxRoutes(app, m); // ---- inbox workflow
+  registerVisibilityRoutes(app, m, { gateway: opts.gateway, ...(opts.answerEngines ? { answerEngines: opts.answerEngines } : {}) }); // ---- AI answer visibility
+  registerAnalyticsRoutes(app, m, opts); // ---- analytics & client reports
 
   // ---------------------------------------------------------------- identity & workspace
   app.get("/v1/me", async (c) => {
@@ -555,7 +564,7 @@ export function createApp(m: Starsign, opts: AppOptions = {}) {
   app.get("/v1/feed/stream", (c) => {
     const p = c.get("principal");
     return streamSSE(c, async (stream) => {
-      const names = ["activity", "post", "alert", "forecast"] as const;
+      const names = ["activity", "post", "alert", "forecast", "inbox"] as const; // "inbox": inbox workflow
       const handlers = names.map((name) => {
         const h = (payload: { workspaceId?: string | null }) => {
           const ws = payload.workspaceId;

@@ -7,9 +7,11 @@ export interface LiveCounters {
   post: number;
   alert: number;
   forecast: number;
+  /** inbox workflow */
+  inbox: number;
 }
 
-const ZERO: LiveCounters = { activity: 0, post: 0, alert: 0, forecast: 0 };
+const ZERO: LiveCounters = { activity: 0, post: 0, alert: 0, forecast: 0, inbox: 0 };
 
 /**
  * Keeps one SSE connection open while the room is on screen. Panels depend on the counter for the

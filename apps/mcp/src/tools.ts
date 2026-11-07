@@ -40,6 +40,11 @@ export const TOOL_NAMES = [
   "list_tracked",
   "get_tracker_report",
   "track_entity",
+  // ---- inbox workflow
+  "list_inbox",
+  "update_inbox_item",
+  // ---- AI answer visibility
+  "get_ai_visibility",
 ] as const;
 export type ToolName = (typeof TOOL_NAMES)[number];
 
@@ -336,7 +341,7 @@ export const handlers = {
       const events = await ctx.client.getLedger({ types: args.types, subjectType: args.subjectType, subjectId: args.subjectId, limit: args.limit });
       return ok(fmt.formatLedger(events), events);
     }),
-} satisfies Record<Exclude<ToolName, keyof typeof moreHandlers | keyof typeof linkHandlers | keyof typeof trackerHandlers>, (ctx: ToolContext, ...args: never[]) => Promise<CallToolResult>>;
+} satisfies Record<Exclude<ToolName, keyof typeof moreHandlers | keyof typeof linkHandlers | keyof typeof trackerHandlers | keyof typeof inboxHandlers /* inbox workflow */ | keyof typeof visibilityHandlers /* AI answer visibility */>, (ctx: ToolContext, ...args: never[]) => Promise<CallToolResult>>;
 
 // ---- registration ----------------------------------------------------------------------------
 
@@ -689,4 +694,172 @@ export function registerTools(server: McpServer, client: StarsignClient, opts: {
   server.registerTool("get_tracker_report", { title: "Who is being talked about", description: "Mentions per tracked party, brand or person across every network, chat app and language: mentions by others, messages by them, distinct people, share of voice, and languages. Organisations include their people.", inputSchema: inputs.get_tracker_report, annotations: READ_ONLY }, (args) => trackerHandlers.get_tracker_report(ctx, args));
   server.registerTool("track_entity", { title: "Track a name", description: "Start tracking a party, brand, company or person. Give every way it is written (aliases in other languages and scripts), its own handles, and context words when the name is a common word.", inputSchema: inputs.track_entity, annotations: { ...WRITES, idempotentHint: false } }, (args) => trackerHandlers.track_entity(ctx, args));
   server.registerTool("create_experiment", { title: "Start an experiment", description: "Start an experiment with 2-6 arms. Then create posts with experimentId and experimentArm. Concluding happens in the app.", inputSchema: inputs.create_experiment, annotations: { ...WRITES, idempotentHint: false } }, (args) => moreHandlers.create_experiment(ctx, args));
+  // ---- inbox workflow
+  server.registerTool("list_inbox", { title: "Team inbox", description: "The shared inbox: conversations (comments, mentions, DMs, chat messages from every network, translated) with their status (open, pending, done, spam), who is on them, priority, labels, and the first-response target (time left or overdue). Filter by status, assignee, label, priority, network or text.", inputSchema: inboxInputs.list_inbox, annotations: READ_ONLY }, (args) => inboxHandlers.list_inbox(ctx, args));
+  server.registerTool("update_inbox_item", { title: "Work an inbox conversation", description: "Set a conversation's status (open, pending, done, spam), add or remove workspace labels, and leave an internal note (never sent; @name mentions notify teammates). Assigning people, priority and rules are for people in the app. Replies go through create_post with actionClass reply and the red lines.", inputSchema: inboxInputs.update_inbox_item, annotations: { ...WRITES, idempotentHint: false } }, (args) => inboxHandlers.update_inbox_item(ctx, args));
+  // ---- end inbox workflow
+  // ---- AI answer visibility
+  server.registerTool("get_ai_visibility", { title: "How AI assistants answer about us", description: "What ChatGPT, Claude, Perplexity and Gemini say when asked the workspace's tracked questions: per tracked name, the share of answers that mention it, its average position among tracked names, tone (-1..1), change against the previous period, by engine and language; the domains answers cite (own vs others); and the latest answers with what each said. Answers vary run to run, so read the trend, not one answer.", inputSchema: visibilityInputs.get_ai_visibility, annotations: READ_ONLY }, (args) => visibilityHandlers.get_ai_visibility(ctx, args));
 }
+
+// ---- inbox workflow ---------------------------------------------------------------------------
+
+export const inboxInputs = {
+  list_inbox: {
+    status: z.array(z.enum(["open", "pending", "done", "spam"])).optional().describe("Only these statuses; default open and pending"),
+    assignee: z.string().min(1).optional().describe("\"none\" for unassigned, or a member's user id"),
+    tag: z.string().min(1).optional().describe("Only conversations with this label"),
+    priority: z.array(z.enum(["normal", "high", "urgent"])).optional(),
+    network: z.array(Network).optional().describe("Only these networks"),
+    q: z.string().min(1).optional().describe("Search the messages (original or translation) and author"),
+    sort: z.enum(["newest", "oldest", "due", "priority"]).default("due").describe("due (default): soonest first-response deadline first"),
+    limit: z.number().int().min(1).max(100).default(30),
+  },
+  update_inbox_item: {
+    activityId: z.string().min(1).describe("The conversation's id (any message id in it works), from list_inbox or search_feed"),
+    status: z.enum(["open", "pending", "done", "spam"]).optional(),
+    addTags: z.array(z.string().min(1)).max(20).optional().describe("Workspace labels to add (only labels the workspace defined)"),
+    removeTags: z.array(z.string().min(1)).max(20).optional(),
+    note: z.string().min(1).max(5000).optional().describe("An internal note for the team; never sent to the customer"),
+  },
+};
+
+interface InboxEntryShape {
+  activity: { id: string; network: string; kind: string; authorName: string | null; authorHandle: string | null; text: string | null; translation?: string | null; lang?: string | null };
+  latest: { text: string | null } | null;
+  state: { status: string; assignee: string | null; priority: string; tags: string[]; messageCount: number };
+  sla: { state: string; msLeft: number | null };
+  notes: number;
+}
+interface InboxListShape {
+  items: InboxEntryShape[];
+  counts: { open: number; pending: number; done: number; spam: number; mine: number; unassigned: number; snoozed: number };
+}
+
+function slaText(sla: InboxEntryShape["sla"]): string | null {
+  if (sla.state === "overdue" && sla.msLeft !== null) return `overdue by ${Math.max(1, Math.round(-sla.msLeft / 60_000))}m`;
+  if ((sla.state === "ok" || sla.state === "soon") && sla.msLeft !== null) return `${Math.round(sla.msLeft / 60_000)}m left to first reply`;
+  if (sla.state === "missed") return "first reply was late";
+  return null;
+}
+
+function inboxLine(e: InboxEntryShape): string {
+  const a = e.activity;
+  const text = (a.translation ?? a.text ?? "").replace(/\s+/g, " ").slice(0, 140);
+  return line([
+    `[${e.state.status}${e.state.priority !== "normal" ? `, ${e.state.priority}` : ""}]`,
+    `${a.authorName ?? a.authorHandle ?? "someone"} on ${a.network} (${a.kind})`,
+    a.lang && a.translation ? `translated from ${a.lang}` : null,
+    `"${text}"`,
+    e.state.messageCount > 1 ? `${e.state.messageCount} messages` : null,
+    e.state.assignee ? `assigned ${e.state.assignee}` : "unassigned",
+    e.state.tags.length ? `labels ${e.state.tags.join(", ")}` : null,
+    slaText(e.sla),
+    e.notes ? `${e.notes} note(s)` : null,
+    a.id,
+  ]);
+}
+
+export const inboxHandlers = {
+  list_inbox: (ctx: ToolContext, args: Args<typeof inboxInputs.list_inbox>) =>
+    run(async () => {
+      const r = await ctx.client.request<InboxListShape>("GET", "/v1/inbox", {
+        query: { status: (args.status ?? ["open", "pending"]).join(","), assignee: args.assignee, tag: args.tag, priority: args.priority?.join(","), network: args.network?.join(","), q: args.q, sort: args.sort, limit: args.limit },
+      });
+      const c = r.counts;
+      const head = `Inbox: ${c.open} open (${c.unassigned} unassigned), ${c.pending} pending, ${c.done} done, ${c.spam} spam${c.snoozed ? `, ${c.snoozed} snoozed` : ""}.`;
+      return ok(r.items.length ? `${head}\n${r.items.map(inboxLine).join("\n")}` : `${head}\nNothing matches.`, r);
+    }),
+  update_inbox_item: (ctx: ToolContext, args: Args<typeof inboxInputs.update_inbox_item>) =>
+    run(async () => {
+      const id = encodeURIComponent(args.activityId);
+      const patch = { ...(args.status ? { status: args.status } : {}), ...(args.addTags?.length ? { addTags: args.addTags } : {}), ...(args.removeTags?.length ? { removeTags: args.removeTags } : {}) };
+      if (!Object.keys(patch).length && !args.note) return ok("Nothing to change: give a status, labels or a note.", null);
+      let entry: InboxEntryShape | null = null;
+      if (Object.keys(patch).length) entry = await ctx.client.request<InboxEntryShape>("PATCH", `/v1/inbox/${id}`, { body: patch });
+      let note: { id: string; mentions: string[] } | null = null;
+      if (args.note) note = await ctx.client.request<{ id: string; mentions: string[] }>("POST", `/v1/inbox/${id}/notes`, { body: { text: args.note } });
+      const parts = [entry ? `Now ${inboxLine(entry)}` : null, note ? `Note added${note.mentions.length ? `, notifying ${note.mentions.length} teammate(s)` : ""}.` : null].filter(Boolean);
+      return ok(parts.join("\n"), { item: entry, note });
+    }),
+};
+// ---- end inbox workflow
+
+// ---- AI answer visibility ----------------------------------------------------------------------
+
+export const visibilityInputs = {
+  get_ai_visibility: {
+    days: z.number().int().min(1).max(180).default(28).describe("How many days back (default 28); compared with the same length before it"),
+    entity: z.string().min(1).optional().describe("Only this tracked name (an id from list_tracked): also lists its latest answers"),
+  },
+};
+
+interface VisAgg {
+  answers: number;
+  mentioned: number;
+  share: number | null;
+  avgPosition: number | null;
+  sentiment: number | null;
+}
+interface VisibilityReportShape {
+  totals: { answers: number; prompts: number; errors: number; capped: number; costUsd: number };
+  entities: (VisAgg & { id: string; name: string; parentId: string | null; ownCitations: number; flagged: number; change: { share: number | null; avgPosition: number | null; sentiment: number | null }; byEngine: (VisAgg & { engine: string })[]; byLanguage: (VisAgg & { lang: string })[] })[];
+  citations: { total: number; own: number; ownShare: number | null; ownDomains: { domain: string; citations: number }[]; otherDomains: { domain: string; citations: number }[] };
+  engines: { id: string; label: string; configured: boolean; enabled: boolean; envVar: string }[];
+}
+interface VisibilityAnswerShape {
+  engine: string;
+  lang: string;
+  question: string;
+  askedAt: string;
+  text: string | null;
+  mentions: { entityId: string; name: string; mentioned: boolean; position: number | null; sentiment: number | null; summary: string | null; flags: string[] }[];
+  citations: { domain: string }[];
+}
+
+const pctOf = (x: number | null) => (x === null ? "n/a" : `${Math.round(x * 100)}%`);
+const signed = (x: number | null, unit = "") => (x === null ? null : `${x > 0 ? "+" : ""}${unit === "pts" ? Math.round(x * 100) : x.toFixed(2)}${unit ? ` ${unit}` : ""}`);
+
+export const visibilityHandlers = {
+  get_ai_visibility: (ctx: ToolContext, args: Args<typeof visibilityInputs.get_ai_visibility>) =>
+    run(async () => {
+      const to = ctx.now();
+      const from = new Date(to.getTime() - args.days * DAY_MS);
+      const r = await ctx.client.request<VisibilityReportShape>("GET", "/v1/visibility/report", { query: { from: from.toISOString(), to: to.toISOString() } });
+      const engines = r.engines.filter((e) => e.enabled).map((e) => e.label);
+      const head = engines.length
+        ? `Last ${args.days} days: ${r.totals.answers} answers to ${r.totals.prompts} question(s) from ${engines.join(", ")}${r.totals.capped ? `; ${r.totals.capped} skipped at the spend cap` : ""}. Answers vary run to run; read the trend.`
+        : `No answer engine is configured (set ${r.engines.map((e) => e.envVar).join(", ")} on the server).`;
+      const rows = (args.entity ? r.entities.filter((e) => e.id === args.entity) : r.entities).filter((e) => e.answers > 0);
+      const lines = rows
+        .slice()
+        .sort((a, b) => (b.share ?? 0) - (a.share ?? 0))
+        .map((e) =>
+          line([
+            `${e.parentId ? "  " : ""}${e.name}`,
+            `in ${pctOf(e.share)} of ${e.answers} answers`,
+            signed(e.change.share, "pts") ? `${signed(e.change.share, "pts")} vs before` : null,
+            e.avgPosition !== null ? `avg position ${e.avgPosition}` : null,
+            e.sentiment !== null ? `tone ${e.sentiment.toFixed(2)}` : null,
+            e.ownCitations ? `${e.ownCitations} own-site citation(s)` : null,
+            e.flagged ? `${e.flagged} answer(s) with possible inaccuracies` : null,
+            e.byEngine.length ? `by engine ${e.byEngine.map((x) => `${x.engine} ${pctOf(x.share)}`).join(", ")}` : null,
+          ]),
+        );
+      const cites = r.citations.total ? `Citations: ${r.citations.own} of ${r.citations.total} to own sites (${pctOf(r.citations.ownShare)}). Top other sources: ${r.citations.otherDomains.slice(0, 5).map((d) => `${d.domain} ${d.citations}`).join(", ") || "none"}.` : null;
+      let latest = "";
+      let answers: VisibilityAnswerShape[] = [];
+      if (args.entity) {
+        answers = await ctx.client.request<VisibilityAnswerShape[]>("GET", "/v1/visibility/answers", { query: { entity: args.entity, limit: 5 } });
+        latest = answers
+          .map((a) => {
+            const m = a.mentions.find((x) => x.entityId === args.entity);
+            return line([`${a.askedAt.slice(0, 10)} ${a.engine} (${a.lang})`, `"${a.question}"`, m?.position ? `#${m.position}` : null, m?.sentiment !== null && m?.sentiment !== undefined ? `tone ${m.sentiment.toFixed(2)}` : null, m?.summary ?? null, m?.flags.length ? `flags: ${m.flags.join("; ")}` : null]);
+          })
+          .join("\n");
+      }
+      const text = [head, lines.join("\n") || "No answers in this period yet.", cites, latest ? `Latest answers mentioning it:\n${latest}` : null].filter(Boolean).join("\n");
+      return ok(text, { report: r, ...(args.entity ? { answers } : {}) });
+    }),
+};
+// ---- end AI answer visibility

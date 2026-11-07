@@ -1,7 +1,8 @@
 import type { ActivityInput, ActivityKind, Media, MetricInput, MetricName, Network } from "@starsign/schema";
 import { z } from "zod";
-import { asNetworkError, classifyHttpStatus, downloadMedia, isAfter, readJson, resolveFetch, type FetchLike } from "./http.ts";
+import { asNetworkError, classifyHttpStatus, isAfter, readJson, resolveFetch, type FetchLike } from "./http.ts";
 import { IdempotencyCache } from "./idempotency.ts";
+import { mediaSource, sendBody, setMediaFile, uploadForm, withUpload, type MediaReader } from "./media-io.ts";
 import { OAuth2Client, type OAuth2Token } from "./oauth.ts";
 import type {
   AccountIdentity,
@@ -394,7 +395,12 @@ export class RedditConnector implements Connector {
 
   /** Media lease: POST /api/media/asset.json → S3 form upload → URL usable in submit (kind image/video) or asset id (gallery). */
   private async uploadMedia(auth: RedditAuth, m: Media): Promise<{ assetId: string; url: string }> {
-    const { bytes, mime } = this.media ? await this.media.fetch(m) : await downloadMedia(resolveFetch(this.fetchImpl), m);
+    // Videos go to the S3 form as a streamed multipart body (exact Content-Length); images are read whole as before.
+    return withUpload(mediaSource(this.media, this.fetchImpl), m, (file) => this.uploadFile(auth, m, file));
+  }
+
+  private async uploadFile(auth: RedditAuth, m: Media, file: MediaReader): Promise<{ assetId: string; url: string }> {
+    const mime = file.mime;
     const filepath = (() => {
       try {
         const base = new URL(m.url).pathname.split("/").pop();
@@ -416,16 +422,16 @@ export class RedditConnector implements Connector {
     const assetId = lease.asset?.asset_id;
     if (!action || !assetId) throw new ConnectorError("reddit media/asset: lease had no upload action or asset id", "unknown", false, lease);
     const uploadUrl = action.startsWith("//") ? `https:${action}` : action;
-    const form = new FormData();
+    const form = uploadForm([file]);
     let key = "";
     for (const f of lease.args?.fields ?? []) {
       form.set(f.name, f.value);
       if (f.name === "key") key = f.value;
     }
-    form.set("file", new Blob([bytes], { type: mime }), filepath);
+    setMediaFile(form, "file", file, filepath);
     let res: Response;
     try {
-      res = await resolveFetch(this.fetchImpl)(uploadUrl, { method: "POST", body: form });
+      res = await sendBody(resolveFetch(this.fetchImpl), uploadUrl, { method: "POST" }, form);
     } catch (err) {
       throw asNetworkError(err, "reddit media upload");
     }
