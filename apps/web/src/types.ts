@@ -37,7 +37,14 @@ export type Network =
   | "kit"
   | "webhook"
   /** Listening only: feeds Starsign reads (blogs, news sites, podcasts). */
-  | "rss";
+  | "rss"
+  | "weibo"
+  | "douyin"
+  | "wecom"
+  | "band"
+  | "zalo"
+  | "viber"
+  | "ok";
 
 export type ActorType = "human" | "operator" | "mcp" | "system";
 export interface Actor {

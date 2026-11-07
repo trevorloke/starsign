@@ -27,7 +27,8 @@ so each connector is tested against the documented request and response shapes. 
 | Reddit | `reddit` | OAuth | Only with an existing registered app | New public access closed 2026-10-31; commercial terms |
 | Discord servers (read + reply) | `discord_bot` | Bot token + server ID | Yes, under 100 servers | Message Content intent: toggle in the Developer Portal; Discord verification at 100+ servers |
 | WhatsApp (business number + business-created groups) | `whatsapp` | Phone number ID + WABA ID + System User token | Yes, on your own Meta app | Meta Business verification for higher limits; Groups API needs an Official Business Account; per-message pricing |
-| WeChat Official Account (messages to the account) | `wechat` | AppID + AppSecret + original ID + server Token (+ AES key) | Verified service account needed for replies | Server IP whitelist; mainland-China hosting realities (see wechat.md) |
+| WeChat Official Account (articles, messages to the account) | `wechat` | AppID + AppSecret + original ID + server Token (+ AES key) | Verified service account needed for replies and for sending to followers | Server IP whitelist; mainland-China hosting realities (see wechat.md) |
+| WeCom (企业微信: customer service 微信客服 + group bot) | `wecom` | CorpID + Customer Service Secret + callback Token/AES key; and/or a group bot URL | Yes | Customer service must be enabled in the WeCom admin console; trusted IPs (see wecom.md) |
 | LINE (groups and chats the bot is in) | `line` | Channel access token + channel secret | Yes | Message quotas by plan |
 | Nostr | `nostr` | Secret key (nsec) + relays | Yes, fully | None |
 | Misskey (and Sharkey, Firefish…) | `misskey` | Server + access token | Yes, fully | None |
@@ -45,6 +46,14 @@ so each connector is tested against the documented request and response shapes. 
 | Kit (ConvertKit) | `kit` | API key (v4) | Yes | None |
 | Custom webhook (Zapier, Make, n8n…) | `webhook` | Outbound URL and/or signing secret | Yes, fully | None |
 | RSS / Atom (listening) | `rss` | Feed or site URL | Yes, fully | None |
+| Naver Band (네이버 밴드; one account per band) | `band` | OAuth 2.0 (BAND developers) | Yes | None known; register a service at developers.band.us (see band.md) |
+| Zalo Official Account (messages to the OA, articles) | `zalo` | OAuth v4 for OA with PKCE + webhook | Yes, for an OA linked to your app | App linked to the OA; some APIs need a verified OA or paid OA package; replies only within Zalo's window (see zalo.md) |
+| Viber Channel (publish) / Viber bot (messages) | `viber` | Channel or bot auth token | Channels yes; bots only with an existing bot | Bots: commercial agreement with Viber since 2024, paid messages (see viber.md) |
+| OK.ru (user feed + groups administered) | `ok` | OAuth 2.0 + signed API calls | User feed only | Group, video and long-token permissions granted on request by OK API support (see ok.md) |
+| KakaoTalk (카카오톡) | none | Not connectable | No API for chats, open chats or channel posts | See kakao.md for what Starsign does instead |
+| Weibo (微博) | `weibo` | OAuth 2.0 (token expires, no refresh: reconnect) | Test users only; posts must link to the app's security domain | App review on open.weibo.com; advanced interfaces for the comment/mention inbox; mainland realities (see weibo.md) |
+| Douyin (抖音; not TikTok) | `douyin` | OAuth (`client_key`, refresh + renew) | No | Mainland-China enterprise developer account; app review + per-capability review (publish, data, comments) (see douyin.md) |
+| Xiaohongshu (小红书), WeChat Channels (视频号), Bilibili, Kuaishou, Zhihu, Baidu Tieba | none | Not connectable | No open API for outside tools (Bilibili, Kuaishou: partners only) | See china-platforms.md for what Starsign does instead |
 
 **What chat monitoring can and cannot see.** Starsign reads only what each platform's official API allows: Discord
 channels its bot can read; Telegram groups its bot is in; LINE groups and chats its bot is in; messages people send
@@ -117,6 +126,13 @@ unofficial tools that try get numbers and accounts banned, so Starsign does not 
 | `STARSIGN_MASTODON_SEARCH_INSTANCES` | Servers whose public hashtag timelines the tracker reads (default `mastodon.social`) |
 | `STARSIGN_MENTION_SOURCES` | Limit the tracker's public scan to some of `bluesky,mastodon,youtube,news` |
 | `WECHAT_API_BASE`, `LINE_API_BASE` | Optional API host overrides (e.g. a regional WeChat host) |
+| `WEIBO_APP_KEY`, `WEIBO_APP_SECRET`, `WEIBO_SECURITY_DOMAIN` (+ optional `WEIBO_SCOPES`, `WEIBO_API_BASE`) | Weibo app; redirect `/oauth/weibo/callback`; posts must link to the security domain |
+| `DOUYIN_CLIENT_KEY`, `DOUYIN_CLIENT_SECRET` (+ optional `DOUYIN_SCOPES`, `DOUYIN_API_BASE`) | Douyin app; redirect `/oauth/douyin/callback`; `DOUYIN_SCOPES` must match the capabilities Douyin granted |
+| `WECOM_API_BASE` | Optional WeCom API host override; customer-service callback is `/webhooks/wecom?account=<CorpID>` |
+| `BAND_CLIENT_ID`, `BAND_CLIENT_SECRET` | Naver Band service; redirect `/oauth/band/callback` |
+| `ZALO_APP_ID`, `ZALO_APP_SECRET`, `ZALO_OA_SECRET_KEY` | Zalo app; redirect `/oauth/zalo/callback`; the OA secret key checks webhook signatures (without it every Zalo delivery is refused) |
+| `VIBER_API_BASE` | Optional; Viber needs no app credentials (each channel or bot brings its token). Bot webhooks need `STARSIGN_PUBLIC_URL` |
+| `OK_CLIENT_ID`, `OK_CLIENT_SECRET`, `OK_APPLICATION_KEY` | OK.ru app; redirect `/oauth/ok/callback`; all three are required |
 | `STARSIGN_LINK_BASE_URL` | Short-link base for tracked links (default `<STARSIGN_PUBLIC_URL>/l` when public). A short domain pointed at the API reads better in posts |
 | `STARSIGN_MAX_UPLOAD_MB` | Largest upload (default 100). Uploads are held in memory, so keep it well under the instance memory; with S3 storage the web app uploads straight to the bucket instead (up to 4 GB video; set bucket CORS to allow `PUT` + `content-type` from the app origin) |
 | `STARSIGN_ALLOW_SIGNUP` | Open sign-up after the first owner |

@@ -64,6 +64,13 @@ export const NETWORK_LABEL: Record<Network, string> = {
   kit: "Kit",
   webhook: "Custom webhook",
   rss: "RSS / Atom",
+  weibo: "Weibo",
+  douyin: "Douyin",
+  wecom: "WeCom",
+  band: "Naver Band",
+  zalo: "Zalo",
+  viber: "Viber",
+  ok: "OK.ru",
 };
 
 /**
@@ -103,6 +110,13 @@ export const NETWORKS: Network[] = [
   "mailchimp",
   "kit",
   "webhook",
+  "weibo",
+  "douyin",
+  "wecom",
+  "band",
+  "zalo",
+  "viber",
+  "ok",
 ];
 
 /** Hard text limits per network, for the inline editor's counter. */
@@ -122,7 +136,7 @@ export const NETWORK_MAX_TEXT: Record<Network, number> = {
   telegram: 4096,
   discord: 2000,
   whatsapp: 4096,
-  wechat: 600,
+  wechat: 20000,
   line: 5000,
   news: 0,
   nostr: 10000,
@@ -141,13 +155,20 @@ export const NETWORK_MAX_TEXT: Record<Network, number> = {
   kit: 100000,
   webhook: 100000,
   rss: 0,
+  weibo: 2000,
+  douyin: 1000,
+  wecom: 2048,
+  band: 10000,
+  zalo: 2000,
+  viber: 7000,
+  ok: 10000,
 };
 
 /** Networks where one post can continue as a thread of replies. */
 export const NETWORK_THREADS: ReadonlySet<Network> = new Set<Network>(["x", "bluesky", "threads", "mastodon", "nostr", "misskey"]);
 
 /** Networks that refuse a post without an image or video. */
-export const NETWORK_NEEDS_MEDIA: ReadonlySet<Network> = new Set<Network>(["instagram", "tiktok", "pinterest", "youtube"]);
+export const NETWORK_NEEDS_MEDIA: ReadonlySet<Network> = new Set<Network>(["instagram", "tiktok", "pinterest", "youtube", "douyin", "wechat"]);
 
 /** Most attachments a single post can carry. */
 export const NETWORK_MAX_MEDIA: Record<Network, number> = {
@@ -166,7 +187,7 @@ export const NETWORK_MAX_MEDIA: Record<Network, number> = {
   telegram: 10,
   discord: 10,
   whatsapp: 1,
-  wechat: 1,
+  wechat: 20,
   line: 5,
   news: 0,
   nostr: 4,
@@ -185,6 +206,13 @@ export const NETWORK_MAX_MEDIA: Record<Network, number> = {
   kit: 10,
   webhook: 10,
   rss: 0,
+  weibo: 9,
+  douyin: 1,
+  wecom: 1,
+  band: 10,
+  zalo: 1,
+  viber: 1,
+  ok: 10,
 };
 
 /** Approximate longest organic video, in seconds, where a network caps it. */

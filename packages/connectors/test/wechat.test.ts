@@ -62,8 +62,8 @@ describe("wechat connect", () => {
         config: { appId: APPID, mode: "safe", webhookUrl: `https://app.example/webhooks/wechat?account=${GH}` },
       },
     ]);
-    expect(c.capabilities()).toMatchObject({ publish: false, reply: true, webhooks: true, accountMetrics: true, fetchActivity: false });
-    expect(c.credentialInputs.map((i) => i.key)).toEqual(["appId", "appSecret", "originalId", "token", "encodingAesKey"]);
+    expect(c.capabilities()).toMatchObject({ publish: true, kinds: ["post"], fetchMetrics: true, reply: true, webhooks: true, accountMetrics: true, fetchActivity: false });
+    expect(c.credentialInputs.map((i) => i.key)).toEqual(["appId", "appSecret", "originalId", "token", "encodingAesKey", "author", "broadcast"]);
   });
 
   it("accepts - for plaintext mode", async () => {
@@ -326,10 +326,6 @@ describe("wechat reply, publish, metrics", () => {
     expect(openidOf(OPENID)).toBe(OPENID);
   });
 
-  it("publish is not supported yet", async () => {
-    await expect(connector().publish()).rejects.toMatchObject({ kind: "rejected" });
-  });
-
   it("reads followers_total from user/get, and nothing when not permitted", async () => {
     fetchMock.mockResolvedValueOnce(json({ access_token: "AT-1", expires_in: 7200 })).mockResolvedValueOnce(json({ total: 1234, count: 1234, data: { openid: [] }, next_openid: "" }));
     const c = connector();
@@ -348,5 +344,247 @@ describe("wechat reply, publish, metrics", () => {
     const [c] = createWeChatConnectors({ STARSIGN_PUBLIC_URL: "https://s.example", WECHAT_API_BASE: "https://api2.weixin.qq.com/" });
     expect(c?.name).toBe("wechat");
     expect(c?.networks).toEqual(["wechat"]);
+  });
+});
+
+// ---- article publishing ------------------------------------------------------------------
+
+describe("wechat connect: publishing settings", () => {
+  it("keeps the author and broadcast choice in config", async () => {
+    fetchMock.mockResolvedValueOnce(json({ access_token: "AT-1", expires_in: 7200 }));
+    const [a] = await connector().connectWithInputs({ network: "wechat", inputs: { ...inputs, author: "Starsign 编辑部", broadcast: "yes" } });
+    expect(a?.config).toMatchObject({ author: "Starsign 编辑部", broadcast: true });
+    fetchMock.mockResolvedValueOnce(json({ access_token: "AT-1", expires_in: 7200 }));
+    const [b] = await connector().connectWithInputs({ network: "wechat", inputs: { ...inputs, broadcast: "" } });
+    expect(b?.config).not.toHaveProperty("broadcast");
+    expect(b?.config).not.toHaveProperty("author");
+  });
+
+  it("refuses an unclear broadcast answer and an over-long author", async () => {
+    await expect(connector().connectWithInputs({ network: "wechat", inputs: { ...inputs, broadcast: "maybe" } })).rejects.toMatchObject({ kind: "rejected" });
+    await expect(connector().connectWithInputs({ network: "wechat", inputs: { ...inputs, author: "x".repeat(17) } })).rejects.toMatchObject({ kind: "rejected" });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("wechat article publishing", () => {
+  const img = (i: number, extra: Record<string, unknown> = {}) => ({ kind: "image" as const, url: `https://cdn.example/p${i}.jpg`, mime: "image/jpeg", ...extra });
+  const input = (over: Partial<import("../src/index.ts").PublishInput> = {}): import("../src/index.ts").PublishInput => ({
+    variantId: "v1",
+    text: "New autumn menu\n\nTry the **chestnut latte** this week.\n\nSee you soon <script>alert(1)</script>",
+    media: [img(1)],
+    thread: [],
+    options: { link: "https://example.cn/menu" },
+    idempotencyKey: "pub-1",
+    ...over,
+  });
+  type Route = (url: string, init: RequestInit | undefined) => Response | Promise<Response>;
+  let sleeps: number[];
+  function wire(routes: Record<string, Route | Response[]>) {
+    fetchMock.mockImplementation(async (url, init) => {
+      const u = String(url);
+      if (u.includes("/stable_token")) return json({ access_token: "AT-1", expires_in: 7200 });
+      for (const [k, r] of Object.entries(routes)) {
+        if (!u.includes(k)) continue;
+        if (Array.isArray(r)) {
+          const next = r.length > 1 ? r.shift() : r[0];
+          return next!.clone();
+        }
+        return r(u, init);
+      }
+      throw new Error(`unexpected ${u}`);
+    });
+  }
+  const pub = () => {
+    sleeps = [];
+    const c = new WeChatConnector({ now: () => clock, publishPollAttempts: 3, publishPollIntervalMs: 5, sleep: async (ms) => void sleeps.push(ms) });
+    c.media = { fetch: async (m) => ({ bytes: new Uint8Array(m.bytes ?? 2048).fill(7), mime: m.mime ?? "image/jpeg" }) };
+    return c;
+  };
+  const calls = (part: string) => fetchMock.mock.calls.filter(([u]) => String(u).includes(part));
+  const bodyOf = (part: string, i = 0) => {
+    const c = calls(part)[i];
+    if (!c) throw new Error(`no call to ${part}`);
+    return c[1]?.body;
+  };
+
+  it("uploads the cover and body image, adds a draft, submits and polls until published", async () => {
+    wire({
+      "material/add_material": [json({ media_id: "THUMB-1", url: "http://mmbiz.qpic.cn/cover" })],
+      "media/uploadimg": [json({ url: "http://mmbiz.qpic.cn/inline1" })],
+      "draft/add": [json({ media_id: "DRAFT-1" })],
+      "freepublish/submit": [json({ errcode: 0, errmsg: "ok", publish_id: "2247483647" })],
+      "freepublish/get": [json({ publish_id: "2247483647", publish_status: 1 }), json({ publish_id: "2247483647", publish_status: 0, article_id: "ART-1", article_detail: { count: 1, item: [{ idx: 1, article_url: "https://mp.weixin.qq.com/s/abc" }] }, fail_idx: [] })],
+    });
+    const account = { ...acct(), config: { appId: APPID, author: "Starsign" } };
+    const r = await pub().publish(account, input());
+    expect(r).toMatchObject({ externalId: "ART-1", url: "https://mp.weixin.qq.com/s/abc" });
+    expect(sleeps).toEqual([5]);
+    // cover: permanent image material, multipart field "media"
+    expect(String(calls("material/add_material")[0]?.[0])).toBe("https://api.weixin.qq.com/cgi-bin/material/add_material?type=image&access_token=AT-1");
+    const form = bodyOf("material/add_material") as FormData;
+    expect(form).toBeInstanceOf(FormData);
+    expect((form.get("media") as File).name).toBe("p1.jpg");
+    expect(bodyOf("media/uploadimg")).toBeInstanceOf(FormData);
+    const draft = JSON.parse(String(bodyOf("draft/add"))) as { articles: Record<string, unknown>[] };
+    const a = draft.articles[0]!;
+    expect(a).toMatchObject({ title: "New autumn menu", author: "Starsign", thumb_media_id: "THUMB-1", content_source_url: "https://example.cn/menu", digest: "Try the chestnut latte this week." });
+    expect(a.content).toContain("<strong>chestnut latte</strong>");
+    expect(a.content).toContain('<img src="http://mmbiz.qpic.cn/inline1"');
+    expect(a.content).not.toContain("<script>");
+    expect(a.content).toContain("&lt;script&gt;");
+    expect(a.content).not.toContain("New autumn menu"); // the title line leaves the body
+    expect(JSON.parse(String(bodyOf("freepublish/submit")))).toEqual({ media_id: "DRAFT-1" });
+    expect(JSON.parse(String(bodyOf("freepublish/get")))).toEqual({ publish_id: "2247483647" });
+  });
+
+  it("uses options.title and keeps the whole text as the body; large images are the cover only", async () => {
+    wire({
+      "material/add_material": [json({ media_id: "THUMB-1" })],
+      "media/uploadimg": [json({ url: "http://mmbiz.qpic.cn/inline2" })],
+      "draft/add": [json({ media_id: "DRAFT-1" })],
+      "freepublish/submit": [json({ publish_id: "9" })],
+      "freepublish/get": [json({ publish_status: 0, article_id: "ART-2", article_detail: { item: [{ article_url: "https://mp.weixin.qq.com/s/x" }] } })],
+    });
+    const r = await pub().publish(acct(), input({ options: { title: "秋季新品" }, media: [img(1, { bytes: 3 * 1024 * 1024 }), img(2)] }));
+    expect(calls("media/uploadimg")).toHaveLength(1);
+    const a = (JSON.parse(String(bodyOf("draft/add"))) as { articles: Record<string, unknown>[] }).articles[0]!;
+    expect(a.title).toBe("秋季新品");
+    expect(a.content).toContain("New autumn menu");
+    expect(a).not.toHaveProperty("author");
+    expect(a).not.toHaveProperty("content_source_url");
+    expect(r.raw).toMatchObject({ images_not_in_body: ["https://cdn.example/p1.jpg"] });
+  });
+
+  it("is idempotent, and a retry after 'still publishing' polls the same job instead of resubmitting", async () => {
+    wire({
+      "material/add_material": [json({ media_id: "THUMB-1" })],
+      "media/uploadimg": [json({ url: "http://mmbiz.qpic.cn/i" })],
+      "draft/add": [json({ media_id: "DRAFT-1" })],
+      "freepublish/submit": [json({ publish_id: "77" })],
+      "freepublish/get": [json({ publish_status: 1 }), json({ publish_status: 1 }), json({ publish_status: 1 }), json({ publish_status: 0, article_id: "ART-3", article_detail: { item: [{ article_url: "https://mp.weixin.qq.com/s/y" }] } })],
+    });
+    const c = pub();
+    const err = (await c.publish(acct(), input()).catch((e: unknown) => e)) as ConnectorError;
+    expect(err).toMatchObject({ kind: "unknown", retryable: true });
+    expect(err.message).toMatch(/still publishing/);
+    const r = await c.publish(acct(), input());
+    expect(r.externalId).toBe("ART-3");
+    expect(calls("freepublish/submit")).toHaveLength(1);
+    expect(calls("draft/add")).toHaveLength(1);
+    await c.publish(acct(), input());
+    expect(calls("freepublish/get")).toHaveLength(4);
+  });
+
+  it.each([
+    [2, /original-content/],
+    [3, /failed to publish/],
+    [4, /platform review/],
+    [5, /deleted/],
+    [6, /banned/],
+  ])("maps publish_status %i to a clear rejected error", async (status, re) => {
+    wire({
+      "material/add_material": [json({ media_id: "THUMB-1" })],
+      "media/uploadimg": [json({ url: "http://mmbiz.qpic.cn/i" })],
+      "draft/add": [json({ media_id: "DRAFT-1" })],
+      "freepublish/submit": [json({ publish_id: "88" })],
+      "freepublish/get": [json({ publish_status: status, fail_idx: [1] })],
+    });
+    const err = (await pub().publish(acct(), input()).catch((e: unknown) => e)) as ConnectorError;
+    expect(err).toMatchObject({ kind: "rejected", retryable: false });
+    expect(err.message).toMatch(re);
+  });
+
+  it("maps upload and submit errors", async () => {
+    wire({ "material/add_material": [json({ errcode: 40009, errmsg: "invalid image size" })] });
+    await expect(pub().publish(acct(), input())).rejects.toMatchObject({ kind: "rejected", message: expect.stringMatching(/too large/) });
+    wire({
+      "material/add_material": [json({ media_id: "THUMB-1" })],
+      "media/uploadimg": [json({ url: "http://mmbiz.qpic.cn/i" })],
+      "draft/add": [json({ media_id: "DRAFT-1" })],
+      "freepublish/submit": [json({ errcode: 48001, errmsg: "api unauthorized" })],
+    });
+    await expect(pub().publish(acct(), input({ idempotencyKey: "pub-x" }))).rejects.toMatchObject({ kind: "rejected", message: expect.stringMatching(/not authorized/) });
+  });
+
+  it("validates title, cover image, media kinds and threads before calling WeChat", async () => {
+    const c = pub();
+    expect(c.validate(acct(), input())).toEqual([]);
+    const codes = (i: import("../src/index.ts").PublishInput) => c.validate(acct(), i).map((x) => x.code);
+    expect(codes(input({ media: [] }))).toContain("media_required");
+    expect(codes(input({ options: { title: "标".repeat(65) } }))).toContain("too_long");
+    expect(codes(input({ text: "x".repeat(70) }))).toContain("too_long"); // first line becomes the title
+    expect(codes(input({ text: "   " }))).toContain("empty");
+    expect(codes(input({ media: [img(1), { kind: "video", url: "https://cdn.example/v.mp4" }] }))).toContain("unsupported_media");
+    expect(codes(input({ media: [img(1, { bytes: 11 * 1024 * 1024 })] }))).toContain("unsupported_media");
+    expect(codes(input({ thread: ["more"] }))).toContain("thread_unsupported");
+    expect(codes(input({ options: { kind: "reel" } }))).toContain("unsupported_media");
+    expect(codes(input({ text: `Title\n\n${"长".repeat(21_000)}` }))).toContain("too_long");
+    await expect(c.publish(acct(), input({ media: [] }))).rejects.toMatchObject({ kind: "rejected", message: expect.stringMatching(/cover image/) });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("broadcast accounts mass-send the draft to all followers with a stable clientmsgid", async () => {
+    wire({
+      "material/add_material": [json({ media_id: "THUMB-1" })],
+      "media/uploadimg": [json({ url: "http://mmbiz.qpic.cn/i" })],
+      "draft/add": [json({ media_id: "DRAFT-9" })],
+      "message/mass/sendall": [json({ errcode: 0, errmsg: "send job submission success", msg_id: 34182, msg_data_id: 206227730 })],
+    });
+    const account = { ...acct(), config: { appId: APPID, broadcast: true } };
+    const r = await pub().publish(account, input());
+    const sent = JSON.parse(String(bodyOf("message/mass/sendall"))) as Record<string, unknown>;
+    expect(sent).toMatchObject({ filter: { is_to_all: true }, mpnews: { media_id: "DRAFT-9" }, msgtype: "mpnews", send_ignore_reprint: 0 });
+    expect(String(sent.clientmsgid)).toMatch(/^[0-9a-f]{32}$/);
+    expect(r).toMatchObject({ externalId: "mass:206227730:2026-11-06", url: null });
+    expect(calls("freepublish")).toHaveLength(0);
+  });
+
+  it.each([
+    [45028, "has no masssend quota", /mass-send quota/, "rejected", false],
+    [45065, "clientmsgid exist", /already sent/, "rejected", false],
+    [45066, "same clientmsgid retry too fast", /too quickly/, "rate_limit", true],
+    [48001, "api unauthorized", /verified service account/, "rejected", false],
+  ] as const)("mass send errcode %i is explained", async (errcode, errmsg, re, kind, retryable) => {
+    wire({
+      "material/add_material": [json({ media_id: "THUMB-1" })],
+      "media/uploadimg": [json({ url: "http://mmbiz.qpic.cn/i" })],
+      "draft/add": [json({ media_id: "DRAFT-9" })],
+      "message/mass/sendall": [json({ errcode, errmsg })],
+    });
+    const err = (await pub().publish({ ...acct(), config: { broadcast: true } }, input()).catch((e: unknown) => e)) as ConnectorError;
+    expect(err).toMatchObject({ kind, retryable });
+    expect(err.message).toMatch(re);
+  });
+});
+
+describe("wechat article metrics", () => {
+  it("reads mass-send totals from datacube/getarticletotal and sums articles of one send", async () => {
+    fetchMock.mockImplementation(async (url) => {
+      const u = String(url);
+      if (u.includes("stable_token")) return json({ access_token: "AT-1", expires_in: 7200 });
+      if (u.includes("/datacube/getarticletotal"))
+        return json({
+          list: [
+            { ref_date: "2026-11-05", msgid: "206227730_1", title: "a", details: [{ stat_date: "2026-11-05", int_page_read_user: 10, int_page_read_count: 12, share_count: 1, add_to_fav_count: 0 }, { stat_date: "2026-11-06", int_page_read_user: 40, int_page_read_count: 55, share_count: 3, add_to_fav_count: 2 }] },
+            { ref_date: "2026-11-05", msgid: "206227730_2", title: "b", details: [{ stat_date: "2026-11-06", int_page_read_user: 5, int_page_read_count: 6, share_count: 0, add_to_fav_count: 1 }] },
+            { ref_date: "2026-11-05", msgid: "999_1", title: "other", details: [{ int_page_read_user: 1000 }] },
+          ],
+        });
+      throw new Error(u);
+    });
+    const rows = await connector().fetchMetrics(acct(), ["mass:206227730:2026-11-05", "ART-1"]);
+    expect(String(fetchMock.mock.calls[1]?.[0])).toBe("https://api.weixin.qq.com/datacube/getarticletotal?access_token=AT-1");
+    expect(JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body))).toEqual({ begin_date: "2026-11-05", end_date: "2026-11-05" });
+    const by = Object.fromEntries(rows.map((r) => [r.metric, r.value]));
+    expect(by).toEqual({ impressions: 61, reach: 45, shares: 3, saves: 3 });
+    expect(rows.every((r) => r.entityId === "mass:206227730:2026-11-05" && r.entityType === "post_variant")).toBe(true);
+  });
+
+  it("returns nothing for freepublish article ids and when datacube refuses the date", async () => {
+    expect(await connector().fetchMetrics(acct(), ["ART-1"])).toEqual([]);
+    expect(fetchMock).not.toHaveBeenCalled();
+    fetchMock.mockResolvedValueOnce(json({ access_token: "AT-1", expires_in: 7200 })).mockResolvedValueOnce(json({ errcode: 61501, errmsg: "date range error" }));
+    expect(await connector().fetchMetrics(acct(), ["mass:1:2026-11-07"])).toEqual([]);
   });
 });

@@ -279,10 +279,43 @@ export class WebhookService {
         if (batch.network !== acc.network || batch.accountExternalId !== acc.externalId) continue;
         items += (await this.listening.ingestItems(acc.workspaceId, acc.id, batch.items)).ingested;
       }
+      if (handler.pullNow?.(body)) this.pullSoon(acc.id);
     }
     const ack = reply ?? handler.ack;
     return { accepted: true, items, ...(ack ? { ack } : {}) };
   }
+
+  /** Accounts being pulled because a delivery said "new items waiting", and those asked again meanwhile. */
+  private readonly pulling = new Set<string>();
+  private readonly pullAgain = new Set<string>();
+
+  /**
+   * Pull one account in the background, so the webhook answers within the platform's deadline. Bursts of
+   * announcements collapse: while a pull runs, further requests for the account queue a single follow-up pull.
+   * Returns the running pull (tests await it; the webhook route does not).
+   */
+  pullSoon(accountId: string): Promise<void> {
+    if (this.pulling.has(accountId)) {
+      this.pullAgain.add(accountId);
+      return Promise.resolve();
+    }
+    this.pulling.add(accountId);
+    const run = async (): Promise<void> => {
+      try {
+        do {
+          this.pullAgain.delete(accountId);
+          await this.listening.ingestAccount(accountId).catch((e) => console.error(`[webhook] pull after announcement failed for ${accountId}:`, e instanceof Error ? e.message : e));
+        } while (this.pullAgain.has(accountId));
+      } finally {
+        this.pulling.delete(accountId);
+      }
+    };
+    this.lastPull = run();
+    return this.lastPull;
+  }
+
+  /** The most recent background pull (for tests). */
+  lastPull: Promise<void> = Promise.resolve();
 
   async receive(connectorName: string, headers: Record<string, string>, rawBody: string, query: Record<string, string> = {}): Promise<{ accepted: boolean; items: number; ack?: { body: string; contentType: string } }> {
     const handler = this.ctx.connectors.get(connectorName)?.webhook;

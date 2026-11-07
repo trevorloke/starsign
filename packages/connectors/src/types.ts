@@ -111,6 +111,12 @@ export interface WebhookHandler {
    * verification echo a `challenge` from the signed body. Null: use `ack` or the default.
    */
   respond?(body: unknown, headers: Record<string, string>): { body: string; contentType: string } | null;
+  /**
+   * True when this delivery only announces that new items are waiting (WeCom's kf_msg_or_event carries a sync token,
+   * not the messages). Core then pulls the verified account(s) right away, after answering, instead of waiting for
+   * the next scheduled poll.
+   */
+  pullNow?(body: unknown): boolean;
 
   /**
    * Per-account secrets (LINE channel secret, a WeChat Official Account's token and AES key). When `route` is set,
